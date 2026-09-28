@@ -999,6 +999,19 @@ window.UI = (function () {
         `<button class="lvl-btn ${lv === x.v ? 'on' : ''}" data-lvl="${x.v}">${x.name}</button>`).join('') +
       `</div><div class="lvl-note">${(Game.SWAN_LEVELS[lv] || {}).note || ''}</div></div>
     </div>`;
+    /* 增量四: 市场微观结构 (开关 + 三档选择器; 开关关闭时选择器置灰) */
+    const micOn = o.micro !== false;
+    const micLv = (o.microLevel === 'lite' || o.microLevel === 'hard') ? o.microLevel : 'std';
+    h += `<div class="set-row ${micOn ? '' : 'off'}">
+      <div class="sr-txt"><b>${I18N.t('set.micro.name')}<em>${I18N.t('set.micro.tag')}</em></b>
+        <p>${I18N.t('set.micro.desc')}</p>
+        <div class="mlvl-row ${micOn ? '' : 'disabled'}">` +
+      ['lite', 'std', 'hard'].map(v =>
+        `<button class="mlvl-btn ${micLv === v ? 'on' : ''}" data-mlvl="${v}"${micOn ? '' : ' disabled'}>` +
+        `${I18N.t('set.microLevel.' + v)}</button>`).join('') +
+      `</div><div class="lvl-note">${I18N.t('set.micro.levelNote')}</div></div>
+      <button class="switch ${micOn ? 'on' : ''}" data-opt="micro" aria-label="${I18N.t('set.micro.name')}"><i></i></button>
+    </div>`;
     /* 已发生事件 */
     h += `<div class="law-warn">📜 本局已发生的黑天鹅事件（${(Game.G.swanLog || []).length}）</div>`;
     if (!(Game.G.swanLog || []).length) {
@@ -1049,6 +1062,14 @@ window.UI = (function () {
       b.onclick = () => {
         Game.setOpt('swanLevel', +b.dataset.lvl);
         toast('黑天鹅频率：' + Game.SWAN_LEVELS[+b.dataset.lvl].name, 'ok');
+        renderSet();
+      };
+    });
+    el.setBody.querySelectorAll('[data-mlvl]').forEach(b => {
+      b.onclick = () => {
+        if ((Game.G.opt || Game.DEF_OPT).micro === false) return;   // 开关关闭时选择器不可用
+        Game.setOpt('microLevel', b.dataset.mlvl);
+        toast(I18N.t('set.micro.name') + '：' + I18N.t('set.microLevel.' + b.dataset.mlvl), 'ok');
         renderSet();
       };
     });

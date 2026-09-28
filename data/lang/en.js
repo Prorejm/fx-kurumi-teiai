@@ -37,6 +37,15 @@ Object.assign(window.I18N_DICT, {
     // —— Toasts ——
     'toast.langChanged': 'Language switched: {name}',
 
+    // —— Settings · Market Microstructure (this task registers framework keys only) ——
+    'set.micro.name': 'Market Microstructure',
+    'set.micro.tag': 'On by default',
+    'set.micro.desc': 'Price is cleared by order flow (L5 order book, tick prints, Kyle λ impact). When off, price strictly falls back to "history × perturbation".',
+    'set.micro.levelNote': 'The higher the tier, the more your large orders move the price — and the fiercer the backlash.',
+    'set.microLevel.lite': 'Lite',
+    'set.microLevel.std': 'Standard',
+    'set.microLevel.hard': 'Hardcore',
+
     // —— Plural example (en distinguishes .one / .other) ——
     'common.items.one': '{n} item',
     'common.items.other': '{n} items'

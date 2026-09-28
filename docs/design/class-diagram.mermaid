@@ -1,0 +1,285 @@
+%% 增量架构 v2 —— 类图（两版共用引擎 + 各自皮肤）
+%% 图例：[共] 两版逐字节一致；[双] 两版各自一份
+classDiagram
+  %% ================= 共享内核 [共] =================
+  class Market {
+    +Object S
+    +init(snap) int
+    +raw(code,i) Bar
+    +bar(code,i) Bar
+    +price(code) float
+    +prevClose(code,i) float
+    +series(code,n,end) Bar[]
+    +agg(code,unit,n,end) Bar[]
+    +avgVol(code,n) float
+    +restored(code,i) MinuteSet
+    +next(n) int
+    +setIdx(i) void
+    +metaOf(code) Meta
+    +isCB(code) bool
+    +isRepo(code) bool
+    +isWealth(code) bool
+    +isFut(code) bool
+    +isOpt(code) bool
+    +isCry(code) bool
+    +isAlt(code) bool
+    +isPm(code) bool
+    +isGm(code) bool
+    +isTradable(code) bool
+    +scaleOf(code) int
+    +microParams(code) MicroParams
+  }
+
+  class Micro {
+    +init(G, deps) void
+    +setHot(codes) void
+    +step(G, i) void
+    +factor(G, code, i) float
+    +anchor(code, i) float
+    +minute(code, i) Tick[]
+    +book(code) Levels
+    +agents(code) AgentStat[]
+    +applyPlayerFlow(G, code, X) void
+    +reversal(G, code) Event[]
+    +microLevel() int
+  }
+
+  class Futures {
+    +CONTRACTS Map
+    +buy(G, code, lots, dir) Res
+    +close(G, code, lots) Res
+    +settle(G, i) void
+    +marginRatio(G, code) float
+    +buyPm(G, kind, amount) Res
+    +redeemPm(G, kind, amount) Res
+  }
+
+  class Options {
+    +bsm(S,K,r,sigma,tau,kind) float
+    +chain(code, i) Chain
+    +buy(G, cid, contracts, dir) Res
+    +close(G, cid, contracts) Res
+    +settle(G, i) void
+    +marginOf(G, cid) float
+    +histVol(code, n) float
+  }
+
+  class AltInv {
+    +buyCry(G, code, qty) Res
+    +sellCry(G, code, qty) Res
+    +subscribe(G, pid, amount) Res
+    +settle(G, i) void
+    +snowballOutcome(prod, path) Outcome
+  }
+
+  class Casino {
+    +GAMES Map
+    +hookLeft(G, venue) int
+    +edgeEff(G, venue, round) float
+    +play(G, gameId, bets) Round
+    +stageOf(G, venue) str
+    +ledger(G) Ledger
+    +toxicDelta(bet) float
+    +loanOnRuin(G) Res
+  }
+
+  class I18N {
+    +t(key,params) str
+    +tN(key,n,params) str
+    +setLang(code) void
+    +getLang() str
+    +onChange(cb) void
+    +applyDom(root) void
+    +fmtMoney(n,opts) str
+    +fmtDate(iso) str
+    +loadDict(code) void
+    +setStrict(v) void
+    +missing str[]
+  }
+
+  class Snapshot {
+    +Array m
+    +Array d
+    +Object s
+    +Array dv
+    +Array syn
+    +Array news
+    +Object mic
+  }
+
+  %% ================= 宿主 [双] =================
+  class Game {
+    +Object G
+    +Object opt
+    +microFactor(code,i) float
+    +kAt(code,i) float
+    +px(code,i) float
+    +pxChg(code) Chg
+    +limits(code) Limits
+    +buy(code,price,shares,side) Res
+    +sell(code,price,shares) Res
+    +fillPrice(code,shares,ref,isBuy) Fill
+    +impactSlip(code,shares) Slip
+    +stepDay(n) int
+    +equity() float
+    +avail() float
+    +marginRatio() float
+    +reset(mode,lev,idx,opt) void
+    +restore(sv) bool
+    +save() void
+    +hash01(str) float
+    +on(fn) void
+    +buyFuture(code,lots,dir) Res
+    +buyOption(cid,contracts,dir) Res
+    +subscribeAlt(pid,amount) Res
+    +casinoPlay(gameId,bets) Round
+  }
+
+  class UI {
+    +Object S
+    +Object el
+    +bind(map) void
+    +refreshAll() void
+    +relabelAll() void
+    +buildWatch() void
+    +select(code) void
+    +renderPos() void
+    +renderTop() void
+    +renderHud() void
+    +renderMicroPanel() void
+    +renderOptionChain() void
+    +renderCasino() void
+    +renderFutures() void
+    +renderAlt() void
+    +drawChart() void
+  }
+
+  class ChartKit {
+    +Object THEME
+    +setTheme(t) void
+    +setI18N(t) void
+    +rgba(hex,a) str
+    +candles(cv,bars,opts) Layout
+    +minute(cv,arr,prevClose,note) void
+    +equity(cv,series,bench,labels) void
+  }
+
+  class Char {
+    +face(state,opts) str
+    +FACES Object
+    +line(key) str
+    +lineForState(state) str
+    +mood(summary) str
+  }
+
+  class VERSION {
+    +id str
+    +saveKey str
+    +lbKey str
+    +langKey str
+    +theme Object
+    +brand Object
+    +dictOverride str
+  }
+
+  %% ================= 数据模型 =================
+  class Position {
+    +code str
+    +shares int
+    +cost float
+    +side str
+    +lots Array
+    +divs Array
+  }
+  class FuturesPos {
+    +code str
+    +dir str
+    +lots int
+    +openPrice float
+    +settlePrice float
+    +marginRate float
+  }
+  class OptionPos {
+    +code str
+    +kind str
+    +strike float
+    +expiryIdx int
+    +dir str
+    +contracts int
+    +premium float
+    +openIdx int
+  }
+  class AltPos {
+    +pid str
+    +amount float
+    +startIdx int
+    +matureIdx int
+    +obs Array
+    +state str
+  }
+  class CasinoState {
+    +chips float
+    +rounds int
+    +wagered float
+    +recovered float
+    +netPnl float
+    +hookLeft Map
+    +byGame Map
+    +stage str
+  }
+  class MicroState {
+    +carry Map
+    +book Map
+    +events Array
+  }
+  class OrderBook {
+    +asks Level[]
+    +bids Level[]
+  }
+  class Level {
+    +price float
+    +size int
+  }
+  class Tick {
+    +t str
+    +p float
+    +v int
+    +side str
+    +agent str
+  }
+  class AgentStat {
+    +kind str
+    +netInflow float
+  }
+
+  %% ================= 关系 =================
+  Game --> Micro : microFactor/step 委托
+  Game --> Futures : 薄委托
+  Game --> Options : 薄委托
+  Game --> AltInv : 薄委托
+  Game --> Casino : 薄委托
+  Game --> Market : price/raw/prevClose
+  Game --> I18N : 文案
+  Micro --> Market : raw/adv/microParams
+  Micro --> OrderBook : 撮合
+  OrderBook *-- Level
+  Micro ..> Tick : 产出
+  Micro ..> AgentStat : 产出
+  Futures --> Market : 结算价
+  Options --> Market : 标的价/波动率
+  AltInv --> Market : 标的口径
+  UI --> Game : 读状态/下单
+  UI --> Market : 行情
+  UI --> ChartKit : 绘图
+  UI --> I18N : t()/applyDom
+  UI --> Char : 表演
+  Char ..> I18N : 台词
+  Market --> Snapshot : init(snap)
+  Main..>VERSION : 读取
+  Main..>I18N : 启动语言
+  Game *-- Position
+  Game *-- FuturesPos
+  Game *-- OptionPos
+  Game *-- AltPos
+  Game *-- CasinoState
+  Game *-- MicroState

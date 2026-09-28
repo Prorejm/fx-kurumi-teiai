@@ -37,6 +37,15 @@ Object.assign(window.I18N_DICT, {
     // —— 토스트 ——
     'toast.langChanged': '언어가 전환되었습니다: {name}',
 
+    // —— 설정 · 시장 미시구조 (본 작업은 프레임워크 key 만 등록) ——
+    'set.micro.name': '시장 미시구조',
+    'set.micro.tag': '기본 켜짐',
+    'set.micro.desc': '가격은 주문 흐름으로 체결·청산됩니다(호가 5단·체결 틱·Kyle λ). 끄면 가격은 「과거 × 교란」으로 엄격히 되돌아갑니다.',
+    'set.micro.levelNote': '단계가 높을수록 큰 주문이 가격을 더 움직이며, 반동도 잦아집니다.',
+    'set.microLevel.lite': '간이',
+    'set.microLevel.std': '표준',
+    'set.microLevel.hard': '하드코어',
+
     // —— 복수형 예시 ——
     'common.items.one': '{n}개',
     'common.items.other': '{n}개'

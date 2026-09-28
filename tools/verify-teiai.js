@@ -92,7 +92,8 @@ const ck = (k, cond, extra) => {
   ck('可交易标的 213', eng.tradable === 213, eng.tradable);
   ck('历史日期序列完整', eng.dates > 400, eng.dates);
   ck('影子价格 + 黑天鹅引擎在', eng.px && eng.swan, [eng.px, eng.swan]);
-  ck('玩法开关 8 项', eng.optKeys === 8, eng.optKeys);
+  // 因新增 opt.micro / opt.microLevel 两个配置项而同步更新 8 → 10：仅计数期望值随产品意图变更，断言逻辑未改
+  ck('玩法开关 10 项', eng.optKeys === 10, eng.optKeys);
   ck('图表主题已换成帝爱色', eng.theme && eng.up === '#c8382c' && eng.down === '#158a5b', [eng.up, eng.down]);
 
   /* ============ 3. 开场 → 主界面 ============ */
@@ -276,8 +277,10 @@ const ck = (k, cond, extra) => {
     lead: (document.querySelector('#setModal .law-lead') || {}).textContent || ''
   }));
   log('SET-UI', setUi);
-  ck('设置面板 6 项开关', setUi.sw === 6, setUi.sw);
-  ck('默认全部开启', setUi.on === 6, setUi.on);
+  // 因新增 opt.micro 开关而同步更新 6 → 7：仅计数期望值随产品意图变更，断言逻辑未改
+  ck('设置面板 7 项开关', setUi.sw === 7, setUi.sw);
+  // 因新增 opt.micro 开关（默认开启）而同步更新 6 → 7：仅计数期望值随产品意图变更，断言逻辑未改
+  ck('默认全部开启', setUi.on === 7, setUi.on);
   ck('黑天鹅 5 档频率', setUi.lv === 5, setUi.lv);
   ck('面板说明默认开启', /默认全部开启/.test(setUi.lead), setUi.lead.slice(0, 24));
   await p.click('#setBody .switch[data-opt="blackswan"]');
@@ -321,7 +324,8 @@ const ck = (k, cond, extra) => {
   });
   log('SAVE', save);
   ck('存档写入成功', save.has, save.key);
-  ck('存档含 8 项玩法开关', save.opt === 8, save.opt);
+  // 因新增 opt.micro / opt.microLevel 两个配置项而同步更新 8 → 10：仅计数期望值随产品意图变更，断言逻辑未改
+  ck('存档含 10 项玩法开关', save.opt === 10, save.opt);
   ck('存档含黑天鹅与事件日志', save.swans && save.log, [save.swans, save.log]);
 
   /* ============ 10. 长跑稳定性 ============ */

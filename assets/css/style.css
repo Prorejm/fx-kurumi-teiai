@@ -1090,6 +1090,17 @@ input[type=range]::-webkit-slider-thumb{
 .lvl-btn:hover{border-color:var(--navy);color:var(--navy)}
 .lvl-btn.on{background:var(--navy);border-color:var(--navy);color:#fff;font-weight:600}
 .lvl-note{font-size:10.5px;color:var(--ink-soft);font-family:var(--mono)}
+/* 微观结构档位选择器（设置面板 · 增量四） */
+.mlvl-row{display:flex;gap:5px;margin:8px 0 6px;flex-wrap:wrap}
+.mlvl-btn{
+  border:1px solid var(--line-2);border-radius:var(--r);background:var(--card);
+  padding:3px 12px;font-size:10.5px;font-family:var(--mono);color:var(--ink-2);cursor:pointer;
+  transition:border-color .16s,background .16s,color .16s;
+}
+.mlvl-btn:hover{border-color:var(--navy);color:var(--navy)}
+.mlvl-btn.on{background:var(--navy);border-color:var(--navy);color:#fff;font-weight:600}
+.mlvl-row.disabled{opacity:.4}
+.mlvl-row.disabled .mlvl-btn{cursor:not-allowed}
 
 /* ---- 黑天鹅记录 ---- */
 .swan-item{

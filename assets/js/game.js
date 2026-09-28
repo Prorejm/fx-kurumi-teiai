@@ -84,7 +84,9 @@ window.Game = (function () {
     shortFee: true,      // 融券借券费
     divTax: true,        // 股息红利差别化个税
     news: true,          // RSS 滚动快讯条
-    swanNews: true       // 黑天鹅事件弹出播报
+    swanNews: true,      // 黑天鹅事件弹出播报
+    micro: true,         // 市场微观结构（订单流定价）总开关
+    microLevel: 'std'    // 微观结构档位: 'lite' | 'std' | 'hard'
   };
 
   const SWAN_LEVELS = [
@@ -1174,9 +1176,14 @@ window.Game = (function () {
     return { list: a, k };
   }
 
-  /* ---- 影子价格: 真实价 × 蝴蝶扰动 × 黑天鹅扰动 ---- */
+  /* ---- 影子价格: 真实价 × 蝴蝶扰动 × 黑天鹅扰动 × 微观结构扰动 ---- */
+  /* 微观结构乘子(第三因子)。T02a 骨架阶段 Micro.factor 恒为 1 ⇒ 逐位回退 */
+  function microFactor(code, i) {
+    if (!window.Micro || typeof Micro.factor !== 'function') return 1;
+    return Micro.factor(code, i);
+  }
   function kAt(code, i) {
-    return bfactorAt(code, i) * swanFactor(code, i);
+    return bfactorAt(code, i) * swanFactor(code, i) * microFactor(code, i);
   }
   function px(code, i) {
     const ii = (i === undefined) ? Market.idx : i;
@@ -1203,11 +1210,16 @@ window.Game = (function () {
     if (key === 'butterfly' && !val) { G.butterfly = 0; G.bStart = {}; }
     if (key === 'blackswan' && !val) { G.swans = []; }
     if (key === 'swanLevel') { G.opt.swanLevel = Math.max(0, Math.min(4, val | 0)); }
+    if (key === 'micro') { G.opt.micro = val !== false; }
+    if (key === 'microLevel') { G.opt.microLevel = (val === 'lite' || val === 'hard') ? val : 'std'; }
+    if (window.Micro && typeof Micro.setOpt === 'function') Micro.setOpt(key, G.opt[key]);
     clearButterflyCache();
-    const label = { blackswan: '黑天鹅事件', butterfly: '蝴蝶效应', impact: '冲击成本', shortFee: '融券费', divTax: '红利税', news: '滚动快讯', swanNews: '事件播报' }[key] || key;
+    const label = { blackswan: '黑天鹅事件', butterfly: '蝴蝶效应', impact: '冲击成本', shortFee: '融券费', divTax: '红利税', news: '滚动快讯', swanNews: '事件播报', micro: '市场微观结构', microLevel: '微观结构档位' }[key] || key;
+    const MLV = { lite: '简化', std: '标准', hard: '硬核' };
     const valTxt = (typeof val === 'boolean')
       ? (val ? '开启' : '关闭')
-      : (key === 'swanLevel' ? ((SWAN_LEVELS[G.opt.swanLevel | 0] || {}).name || val) : String(val));
+      : (key === 'swanLevel' ? ((SWAN_LEVELS[G.opt.swanLevel | 0] || {}).name || val)
+        : (key === 'microLevel' ? (MLV[G.opt.microLevel] || String(val)) : String(val)));
     log('设置', '', '玩法开关', label + ' → ' + valTxt, 'warn');
     after();
     return ok(true, '设置已更新');
@@ -2016,6 +2028,10 @@ window.Game = (function () {
     G.opt = Object.assign({}, DEF_OPT, sv.opt || {});
     G.opt.blackswan = G.opt.blackswan !== false;
     G.opt.swanLevel = G.opt.swanLevel === undefined ? 3 : G.opt.swanLevel;
+    /* 新增玩法开关兜底: 旧存档缺少 micro/microLevel 时回落默认值 (否则 kAt 会变 NaN) */
+    for (const _ok in DEF_OPT) { if (G.opt[_ok] === undefined) G.opt[_ok] = DEF_OPT[_ok]; }
+    G.opt.micro = G.opt.micro !== false;
+    G.opt.microLevel = (G.opt.microLevel === 'lite' || G.opt.microLevel === 'hard') ? G.opt.microLevel : 'std';
     /* 旧存档迁移: 回填持仓的 lots / divs (先进先出与红利税依赖它) */
     G.positions.forEach(p => {
       if (!p.lots || !p.lots.length) p.lots = [{ shares: p.shares, idx: p.openIdx || 0 }];
@@ -2046,6 +2062,7 @@ window.Game = (function () {
     G.butterfly = 0; G.hindsight = 0; G.auditN = 0;
     G.bSeed = 'b' + Math.floor(Math.random() * 1e9);
     G.bStart = {};
+    if (window.Micro && typeof Micro.reset === 'function') Micro.reset(G.bSeed);
     /* 玩法开关默认全开 (opt.opt 可覆盖, 例如开局前在设置里关掉某些机制) */
     G.swans = []; G.swanLog = []; G.swanSeq = 0;
     G.opt = Object.assign({}, DEF_OPT, (opt && opt.opt) || {});
@@ -2112,7 +2129,7 @@ window.Game = (function () {
     /* ---------- 分红除权 ---------- */
     settleDividends, dividendTaxFIFO, divTaxRate, consumeLots,
     /* ---------- 操作反作用力 ---------- */
-    impactSlip, fillPrice, px, pxChg, shadowed, kAt, bfactor, bfactorAt,
+    impactSlip, fillPrice, px, pxChg, shadowed, kAt, microFactor, bfactor, bfactorAt,
     auditHindsight, hash01, SHORT_FEE_RATE,
     /* ---------- 黑天鹅 / 玩法开关 ---------- */
     rollSwan, activeSwans, swanSummary, swanFactor, setOpt, optOf,

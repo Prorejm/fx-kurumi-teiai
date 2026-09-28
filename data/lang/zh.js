@@ -40,6 +40,15 @@ Object.assign(window.I18N_DICT, {
     // —— toast / 提示 ——
     'toast.langChanged': '已切换语言：{name}',
 
+    // —— 玩法设置 · 市场微观结构（增量四；本任务仅登记框架 key）——
+    'set.micro.name': '市场微观结构',
+    'set.micro.tag': '默认开启',
+    'set.micro.desc': '价格由订单流撮合出清（盘口五档、逐笔成交、Kyle λ 价格冲击）。关闭后价格严格退回「历史 × 扰动」。',
+    'set.micro.levelNote': '档位越高，你的大单越能拉动价格，反噬也越频繁。',
+    'set.microLevel.lite': '简化',
+    'set.microLevel.std': '标准',
+    'set.microLevel.hard': '硬核',
+
     // —— 复数示例（中/日/韩同形，读 .other）——
     'common.items.one': '{n} 项',
     'common.items.other': '{n} 项'
