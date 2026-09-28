@@ -581,8 +581,11 @@ window.UI = (function () {
       if (window.Micro && typeof Micro.minute === 'function' && Micro.enabled()) {
         const mm = Micro.minute(S.code, Market.idx);
         if (mm && mm.length) {
+          /* CP3：把「散户正在跟进来」直接标在分时图上，让放大效应可见 */
+          const hv = (typeof Micro.herdOf === 'function') ? Micro.herdOf(S.code) : 1;
+          const herd = (hv > 1.05) ? ' · 散户跟风 ×' + hv.toFixed(1) : '';
           ChartKit.minute(el.kchart, mm.map(x => ({ p: x.c * k, v: x.v })), Market.prevClose(S.code) * k,
-            '当日走势 · 逐笔撮合推演');
+            '当日走势 · 逐笔撮合推演' + herd);
           return;
         }
       }

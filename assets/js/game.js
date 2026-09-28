@@ -455,6 +455,10 @@ window.Game = (function () {
     side = side || 'long';
     const cb = creditBlocked();
     if (cb) return ok(false, cb);
+    /* 反噬链：限制交易期内不得新开仓（平仓不受限，仍可卖出/平空） */
+    if (window.Micro && typeof Micro.restricted === 'function' && Micro.restricted(code)) {
+      return ok(false, '该标的正处于限制交易期…交易所盯上了你的账户，过几个交易日再来');
+    }
     const p = pos(code);
     if (p && p.shares > 0 && p.side !== side) {
       return ok(false, side === 'short' ? '你已持有多单，请先平仓再开空' : '你已持有空单，请先平仓再开多');
@@ -708,6 +712,10 @@ window.Game = (function () {
       const fp = fillPrice(p.code, shares, px(p.code), isBuy);
       const price = fp.price;
       const amount = price * shares;
+      /* 微观结构：强平/一键清仓是真实抛压，砸进盘口就该压价（平空=买回为正、卖出为负） */
+      if (window.Micro && typeof Micro.applyPlayerFlow === 'function') {
+        Micro.applyPlayerFlow(G, p.code, p.side === 'short' ? amount : -amount);
+      }
       const fee = (p.side === 'short' ? buyFee : sellFee)(amount, p.code);
       const pnl = (p.side === 'short')
         ? (p.cost * shares - amount - fee)
@@ -742,6 +750,13 @@ window.Game = (function () {
       moved += realN;
       /* 微观结构：玩家当日净流 → Kyle λ → 引力锚(OU) carry 递推（micro 关闭时整段短路） */
       if (window.Micro && typeof Micro.step === 'function') Micro.step(G, Market.idx);
+      /* 反噬链播报：龙虎榜 / 异常波动问询 / 限制交易 */
+      if (window.Micro && typeof Micro.takeEvents === 'function') {
+        Micro.takeEvents().forEach(ev => {
+          const m = Market.metaOf(ev.code);
+          log('监管', ev.code, m ? m.name : ev.code, ev.text, 'warn');
+        });
+      }
       accrueInterest(1);
       settleDividends();       // 除权除息派现 (派发时不预扣税)
       cbResolve();             // 可转债打新中签 / 缴款 / 弃购

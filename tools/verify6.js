@@ -429,6 +429,193 @@ const IDXS = [90, 100, 110, 120, 140, 160, 200, 260, 300, 380];
   ck('A7 读档 microFactor 逐位一致', a7.sameFactor, [a7.f1, a7.f2]);
   ck('A7 读档后 kAt 带上玩家冲击', a7.k2 > 1, a7.k2);
 
+  /* ============ 11b. A4b 单笔冲量后 1~5 日偏离单调递减（A4 的互补口径）============ */
+  console.log('\n--- 11b. A4b 单笔冲量 → 偏离单调递减 ---');
+  const a4b = await p.evaluate(new Function('', SETUP + `
+    function path(ratio, days) {
+      prepA();
+      if (ratio > 0) { var r = buyFrac(CODE_A, ratio); if (!r.ok) return { err: r.msg }; }
+      var seq = [];
+      for (var d = 0; d <= days; d++) { seq.push(Game.px(CODE_A)); Game.stepDay(1); }
+      return { seq: seq };
+    }
+    var base = path(0, 6);
+    var one = path(0.5, 6);
+    if (one.err) return { err: one.err };
+    var dev = one.seq.map(function (v, i) { return +(v / base.seq[i] - 1).toFixed(6); });
+    return { dev: dev };
+  `));
+  log('A4b dev(逐日)', a4b.dev);
+  ck('A4b 单笔冲量后偏离单调递减（OU 回归）',
+    a4b.dev.every((v, i) => i === 0 || v <= a4b.dev[i - 1] + 1e-9), a4b.dev);
+  ck('A4b 冲量首日确实产生偏离', a4b.dev[0] > 0, a4b.dev[0]);
+
+  /* ============ 11c. A11 收盘集合竞价校准 + 成交量守恒 ============ */
+  console.log('\n--- 11c. A11 收盘集合竞价校准 ---');
+  const a11 = await p.evaluate(new Function('', SETUP + `
+    prepA();
+    var mm = Micro.minute(CODE_A, Market.idx);
+    var tk = Micro.ticks(CODE_A, Market.idx);
+    var bar = Market.bar(CODE_A);
+    var volT = 0; for (var i = 0; i < tk.length; i++) volT += tk[i].size;
+    var volM = 0; for (var j = 0; j < mm.length; j++) volM += mm[j].v;
+    var last = mm[mm.length - 1].c;
+    return { n: mm.length, last: last, barC: +bar.c.toFixed(2), diff: +Math.abs(last - bar.c).toFixed(4),
+      openBar: +bar.o.toFixed(2), openMin: mm[0].o,
+      volT: volT, volM: volM, volSame: volT === volM };
+  `));
+  log('A11', a11);
+  ck('A11 分时 240 根', a11.n === 240, a11.n);
+  ck('A11 末点收敛到当日收盘（|差| ≤ 0.01，仅 2 位舍入）', a11.diff <= 0.01, a11.diff);
+  ck('A11 成交量守恒 volTick === volMinute', a11.volSame, [a11.volT, a11.volM]);
+
+  /* ============ 11d. A12 跟风放大 + 小盘易拉 ============ */
+  console.log('\n--- 11d. A12 跟风放大与弹性 ---');
+  const a12 = await p.evaluate(new Function('', SETUP + `
+    function run(code, xRatio) {
+      prepA();
+      var adv = Micro.advNotional(code, Market.idx);
+      var px0 = Game.px(code);
+      var sh = Math.floor(adv * xRatio / px0 / 100) * 100;
+      var notional = sh * px0;
+      var amp = Micro.herdAmp(code, Market.idx, notional);
+      var own = Micro.kyleImp(code, Market.idx, notional);
+      if (xRatio > 0) { var r = Game.buy(code, px0 * 1.02, sh); if (!r.ok) return { err: r.msg }; }
+      var t0 = Game.px(code);
+      Game.stepDay(1);
+      return { adv: Math.round(adv), notional: Math.round(notional), amp: +amp.toFixed(3),
+        own: +own.toFixed(6), carry: Micro.carry(code), t1: Game.px(code), t0: t0 };
+    }
+    var out = { tiers: [] };
+    [0.001, 0.005, 0.02, 0.2, 1].forEach(function (r) {
+      var base = run(CODE_A, 0), a = run(CODE_A, r);
+      out.tiers.push({ xAdv: r, amp: a.amp, own: a.own,
+        dev1: a.err ? null : +(a.t1 / base.t1 - 1).toFixed(6) });
+    });
+    /* 小盘易拉：同一 X 元，比较 ADV 差异最大的两只 */
+    var list = Market.tradable.slice(0, 40).map(function (m) {
+      return { code: m.code, adv: Micro.advNotional(m.code, 120), el: Micro.elasticity(m.code, 120) };
+    }).sort(function (p, q) { return p.adv - q.adv; });
+    var small = list[0], big = list[list.length - 1];
+    function devOf(code, notional) {
+      prepA();
+      var basePx = Game.px(code);
+      var sh = Math.floor(notional / basePx / 100) * 100;
+      var b0 = Game.px(code); Game.stepDay(1); var b1 = Game.px(code);
+      prepA();
+      var r = Game.buy(code, basePx * 1.02, sh);
+      if (!r.ok) return { err: r.msg };
+      var a1 = Game.px(code); Game.stepDay(1); var a2 = Game.px(code);
+      return { dev: +(a2 / b1 - 1).toFixed(6), shares: sh };
+    }
+    var X = 5e6;   // 同一 X 元 = 500 万
+    out.small = { code: small.code, adv: Math.round(small.adv), el: small.el, d: devOf(small.code, X) };
+    out.big = { code: big.code, adv: Math.round(big.adv), el: big.el, d: devOf(big.code, X) };
+    return out;
+  `));
+  a12.tiers.forEach(t => log('  X/ADV=' + t.xAdv, t));
+  log('  小盘', a12.small);
+  log('  大盘', a12.big);
+  const amps = a12.tiers.map(t => t.amp);
+  ck('A12 跟风倍数随参与率单调不降', amps.every((v, i) => i === 0 || v >= amps[i - 1]), amps);
+  ck('A12 小额委托不放大（amp === 1）', amps[0] === 1, amps[0]);
+  ck('A12 满点燃时标准档放大 5x（∈[4.5,5]）', amps[amps.length - 1] >= 4.5 && amps[amps.length - 1] <= 5.0,
+    amps[amps.length - 1]);
+  ck('A12 小盘易拉：同额买入 dev 显著大于大盘',
+    a12.small.d.dev > a12.big.d.dev * 1.5, [a12.small.d.dev, a12.big.d.dev]);
+  ck('A12 小盘 500 万元即可推动 > 0.3%', a12.small.d.dev > 0.003, a12.small.d.dev);
+  ck('A12 弹性分：小盘 > 大盘', a12.small.el > a12.big.el, [a12.small.el, a12.big.el]);
+
+  /* ============ 11e. A13 g_liq clamp 后半衰期（含超大盘样本）============= */
+  console.log('\n--- 11e. A13 g_liq 夹逼后半衰期 ---');
+  const a13 = await p.evaluate(new Function('', SETUP + `
+    function sample(idx) {
+      Game.reset('replay', 1, 120, {});
+      Market.setIdx(idx);
+      var hls = Market.tradable.slice(0, 20).map(function (m) {
+        return +(Math.LN2 / Micro.thetaEff(m.code, idx, 0.015, 0)).toFixed(2);
+      });
+      var advs = Market.tradable.slice(0, 20).map(function (m) {
+        return Math.round(Micro.advNotional(m.code, idx));
+      });
+      return { idx: idx, hlMin: Math.min.apply(null, hls), hlMax: Math.max.apply(null, hls),
+        advMax: Math.max.apply(null, advs) };
+    }
+    return { at120: sample(120), at260: sample(260),
+      clamp: [Micro.G_LIQ_MIN, Micro.G_LIQ_MAX] };
+  `));
+  log('A13 @idx120', a13.at120);
+  log('A13 @idx260', a13.at260);
+  ck('A13 g_liq 夹逼区间 = [0.75, 1.333]', a13.clamp[0] === 0.75 && a13.clamp[1] === 1.333, a13.clamp);
+  ck('A13 @idx120 半衰期 ∈ [15,40]', a13.at120.hlMin >= 15 && a13.at120.hlMax <= 40,
+    [a13.at120.hlMin, a13.at120.hlMax]);
+  ck('A13 @idx260（含更大规模样本）半衰期 ∈ [15,40]',
+    a13.at260.hlMin >= 15 && a13.at260.hlMax <= 40, [a13.at260.hlMin, a13.at260.hlMax]);
+
+  /* ============ 11f. A9 分时 ≠ 历史 bar 线性/正弦插值 ============ */
+  console.log('\n--- 11f. A9 日内内生性 ---');
+  const a9 = await p.evaluate(new Function('', SETUP + `
+    prepA();
+    var mm = Micro.minute(CODE_A, Market.idx);
+    var bar = Market.bar(CODE_A);
+    var n = mm.length;
+    function rms(a, b) { var s = 0; for (var i = 0; i < n; i++) { var d = a[i] - b[i]; s += d * d; } return Math.sqrt(s / n); }
+    var lin = [], sin = [], mic = [];
+    for (var i = 0; i < n; i++) {
+      var t = i / (n - 1);
+      lin.push(bar.o + (bar.c - bar.o) * t);
+      sin.push(bar.o + (bar.c - bar.o) * t + (bar.h - bar.l) * 0.5 * Math.sin(Math.PI * t));
+      mic.push(mm[i].c);
+    }
+    var rng = Math.max(1e-6, bar.h - bar.l);
+    /* 高低点出现时刻：必须由撮合涌现 —— 换交易日/换种子即应改变（若为插值则恒定不动）。
+       注：收盘集合竞价会把末点钉在 bar.c，故在「收在全天最高」的 bar 上最高点必然落在收盘，
+       这是校准的必然结果而非插值；因此取多个交易日采样，考察时刻是否随行情改变。 */
+    function atOfDay(advDays, seed) {
+      prepA();
+      Game.G.bSeed = seed; Micro.reset(seed);
+      for (var d = 0; d < advDays; d++) Game.stepDay(1);
+      var s = Micro.minute(CODE_A, Market.idx);
+      var hi = 0, lo = 0;
+      for (var k = 1; k < s.length; k++) { if (s[k].h > s[hi].h) hi = k; if (s[k].l < s[lo].l) lo = k; }
+      var bar = Market.bar(CODE_A);
+      return { hi: hi, lo: lo, closeIsHigh: Math.abs(bar.c - bar.h) < bar.h * 1e-6 };
+    }
+    var ats = [atOfDay(0, 's1'), atOfDay(1, 's1'), atOfDay(2, 's1'), atOfDay(3, 's2')];
+    var hiSet = {}, loSet = {};
+    ats.forEach(function (a) { hiSet[a.hi] = 1; loSet[a.lo] = 1; });
+    return { n: n, rng: +rng.toFixed(2),
+      rmsLin: +(rms(mic, lin) / rng).toFixed(4), rmsSin: +(rms(mic, sin) / rng).toFixed(4),
+      ats: ats, hiDistinct: Object.keys(hiSet).length, loDistinct: Object.keys(loSet).length };
+  `));
+  log('A9', a9);
+  ck('A9 分时 ≠ 线性插值（归一化 RMS > 0.15）', a9.rmsLin > 0.15, a9.rmsLin);
+  ck('A9 分时 ≠ 正弦插值（归一化 RMS > 0.15）', a9.rmsSin > 0.15, a9.rmsSin);
+  /* 高低点时刻随种子改变 ⇒ 由撮合涌现，而非插值固定 */
+  ck('A9 最高点时刻随种子变化（非插值固定）', a9.hiDistinct >= 2, [a9.ats, a9.hiDistinct]);
+  ck('A9 最低点时刻随种子变化（非插值固定）', a9.loDistinct >= 2, [a9.ats, a9.loDistinct]);
+
+  /* ============ 11g. A10 同种子可复现 / 换种子形态变化 ============ */
+  console.log('\n--- 11g. A10 确定性 ---');
+  const a10 = await p.evaluate(new Function('', SETUP + `
+    function seq(seed) {
+      prepA();
+      Game.G.bSeed = seed;
+      Micro.reset(seed);
+      return Micro.minute(CODE_A, Market.idx).map(function (x) { return x.c; });
+    }
+    var s1 = seq('seedA'), s1b = seq('seedA'), s2 = seq('seedB');
+    var same = s1.length === s1b.length && s1.every(function (v, i) { return v === s1b[i]; });
+    var cnt = 0, d = 0;
+    for (var i = 0; i < s1.length; i++) { if (s1[i] !== s2[i]) cnt++; d += Math.abs(s1[i] - s2[i]); }
+    return { n: s1.length, sameSeedIdentical: same, diffPoints: cnt,
+      meanAbsDiff: +(d / Math.max(1, s1.length)).toFixed(4) };
+  `));
+  log('A10', a10);
+  ck('A10 同种子分时逐点可复现', a10.sameSeedIdentical, a10.n);
+  ck('A10 换种子形态发生变化（差异点 > 50%）', a10.diffPoints > a10.n * 0.5, [a10.diffPoints, a10.n]);
+  ck('A10 换种子平均绝对差 > 0', a10.meanAbsDiff > 0, a10.meanAbsDiff);
+
   /* ============ 12. 性能实测 ============ */
   console.log('\n--- 12. 性能 ---');
   const perf = await p.evaluate(new Function('', SETUP + `
@@ -449,6 +636,26 @@ const IDXS = [90, 100, 110, 120, 140, 160, 200, 260, 300, 380];
       return { level: level, median: +runs[25].toFixed(3), p90: +runs[45].toFixed(3), max: +runs[49].toFixed(3) };
     }
     var res = { std: bench('std'), hard: bench('hard') };
+    /* 最坏情况：热集 8 只完整订单簿逐日预计算（stepDay 内摊销） */
+    function benchHot(level) {
+      prepA();
+      Game.setOpt('microLevel', level);
+      buyFrac(CODE_A, 0.5);
+      Game.stepDay(1);
+      Micro.setHot(Market.tradable.slice(0, 8).map(function (m) { return m.code; }));
+      for (var i = 0; i < 10; i++) Game.stepDay(1);
+      var runs = [];
+      for (var j = 0; j < 50; j++) {
+        var t = performance.now();
+        Game.stepDay(1);
+        runs.push(performance.now() - t);
+      }
+      runs.sort(function (a, b) { return a - b; });
+      Micro.setHot([]);
+      return { level: level, median: +runs[25].toFixed(3), p90: +runs[45].toFixed(3), max: +runs[49].toFixed(3) };
+    }
+    res.stdHot8 = benchHot('std');
+    res.hardHot8 = benchHot('hard');
     /* 冷启动：清空派生缓存后首次取分时（240 分钟 × 5 代理聚合） */
     Micro.reset(Game.G.bSeed);
     var t0 = performance.now();
@@ -461,9 +668,13 @@ const IDXS = [90, 100, 110, 120, 140, 160, 200, 260, 300, 380];
   `));
   log('PERF-std', perf.std);
   log('PERF-hard', perf.hard);
+  log('PERF-hot8-std', perf.stdHot8);
+  log('PERF-hot8-hard', perf.hardHot8);
   log('PERF-minute', { hot1: perf.minuteCold, hot8: perf.minute8 });
   ck('性能：标准档 stepDay(1) 中位 < 50ms', perf.std.median < 50, perf.std.median);
   ck('性能：硬核档 stepDay(1) 中位 < 120ms', perf.hard.median < 120, perf.hard.median);
+  ck('性能：热集 8 只完整簿 标准档 stepDay(1) 中位 < 50ms', perf.stdHot8.median < 50, perf.stdHot8.median);
+  ck('性能：热集 8 只完整簿 硬核档 stepDay(1) 中位 < 120ms', perf.hardHot8.median < 120, perf.hardHot8.median);
 
   /* ============ 13. 零 console / page error ============ */
   console.log('\n--- 13. 稳定性 ---');

@@ -5,11 +5,15 @@
  *
  * 阶段：
  *   T02a      = 'skeleton'      仅接线，factor() 恒为 1（零影响）
- *   T02b-CP1  = 'cp1-orderbook' 订单簿 + 5 类代理 + 撮合 + 逐笔 + 分时聚合。
- *                               factor() 仍返回字面量 1 ⇒ 对外价格零影响。
- *   T02b-CP2  = 'cp2-takeover'（本文件当前阶段）
- *              玩家流 → Kyle λ → 引力锚（OU）carry 递推 → 定价接管。
- *              Micro.factor = exp(carry)；**无玩家交易 ⇒ carry≡0 ⇒ factor 精确 === 1**。
+ *   T02b-CP1  = 'cp1-orderbook' 订单簿 + 5 类代理 + 撮合 + 逐笔 + 分时聚合
+ *   T02b-CP2  = 'cp2-takeover'  玩家流 → Kyle λ → 引力锚(OU) carry → 定价接管
+ *   T02b-CP3  = 'cp3-backlash'（本文件当前阶段）
+ *              · g_liq 夹到 [0.75, 1.333]，令半衰期带宽 [15,40] 恒成立
+ *              · 收盘集合竞价校准：分时末点收敛到当日收盘（锚 A），成交量守恒不变
+ *              · 跟风放大：散户跟随玩家净流，把冲击放大到可感知量级
+ *              · 5 类代理精细化：处置效应 / 隔日了结 / VWAP 分批 / 双边做市 / 高频反转
+ *              · 反噬链：获利盘涌出 → 龙虎榜 / 异常波动问询 / 限制交易
+ *              · 性能分层：热集完整簿 / 轻量净流 / 其余懒计算
  *
  * 契约（架构 §决策2）：
  *   - 以宿主 Game.G（种子/opt/microCarry）与 Market（历史序列）为唯一输入
@@ -20,7 +24,7 @@
 window.Micro = (function () {
   'use strict';
 
-  var STAGE = 'cp2-takeover';
+  var STAGE = 'cp3-backlash';
   var LEVELS = ['lite', 'std', 'hard'];
   var MINUTES = 240;                 // 交易日分钟数（9:30-11:30 + 13:00-15:00）
   var AGENTS = ['retail', 'hotmoney', 'inst', 'quant', 'mm'];   // mm 最后：库存对冲需读累计净流
@@ -34,18 +38,55 @@ window.Micro = (function () {
   };
   var CAP = 0.5;                     // 对数偏离上限 ±50%（clamp）
   var ADV_REF = 1e8;                 // 流动性修正基准 ADV（元）
-  /* 永久冲击「吸收门限」：占 ADV 不足 PERM_MIN 的委托当日即被盘口吸收，不产生**永久**冲击
-     （其临时冲击已由 game.js 的 impactSlip / fillPrice 建模）。超过该门限的部分才走平方
-     根律：imp = λ·sqrt(max(0, |X|/ADV − PERM_MIN))。取 0.1% —— 对设计验收档位
-     （X/ADV = 10%/50%/100%/300%）的影响 < 0.5%，远小于其 dev 阈值余量。 */
-  var PERM_MIN = 1e-3;
   var HIST_MAX = 240;                // 每标的最多保留的 carry 历史点（供 K 线回看）
+
+  /* 永久冲击「吸收门限」。
+     永久冲击 vs 瞬时冲击（permanent vs transient impact）是市场微观结构的标准二分：
+     小额委托被盘口吸收、流动性回补后价格回归，只留下**瞬时成本**——而瞬时成本已由
+     game.js 的 impactSlip / fillPrice 建模，再叠加一次永久冲击即为**重复计价**。
+     故占 ADV 不足 PERM_MIN 的委托不留永久 carry，只走：
+         imp = λ·sqrt(max(0, |X|/ADV − PERM_MIN))
+     取 0.1% —— 对设计验收档位（X/ADV = 10%/50%/100%/300%）的影响 < 0.5%。 */
+  var PERM_MIN = 1e-3;
+
+  /* ---- CP3-0：流动性修正夹逼，令半衰期带宽 [15,40] 恒成立 ----
+     实测半衰期 ≈ H / g_liq（θ_eff = (ln2/H)·g_liq·h）。若不夹，ADV > 6.8e9 元的超大盘
+     g_liq > 1.333 ⇒ 标准档半衰期 < 15 日，跌出设计带宽（这是迟早会触发的）。
+     夹到 [0.75, 1.333] 后：标准档 H=20 ⇒ 半衰期恒 ∈ [15.0, 26.7] 日。 */
+  var G_LIQ_MIN = 0.75;
+  var G_LIQ_MAX = 1.333;
+
+  /* ---- CP3-1：收盘集合竞价窗口（末端对冲，把日内净流残差归零）---- */
+  var CLOSE_WIN = 30;                // 收盘前 30 分钟为集合竞价校准窗口
+
+  /* ---- CP3-4：跟风放大（玩家「我能拉股票」的手感来源）----
+     现实中游资不是靠自有资金拉票，而是靠跟风盘放大。故在自有冲击之上叠加跟风倍数：
+         imp_total = imp_own × (1 + HERD_GAIN[level] × ignite)
+     点燃度 ignite 随「超出吸收门限的参与率」线性上升，IGNITE_REF 处完全点燃。
+     满点燃时总放大 = 3x(简化) / 5x(标准) / 7x(硬核)。 */
+  var IGNITE_REF = 2e-3;             // 参与率（扣掉吸收门限后）达 0.2% 即完全点燃
+  var HERD_GAIN = { lite: 2.0, std: 4.0, hard: 6.0 };
+
+  /* ---- CP3-4：反噬链 ---- */
+  var PROFIT_TAKE = 0.015;           // 偏离超过 1.5% 后获利盘开始涌出
+  var PROFIT_TAKE_K = 0.5;           // 获利盘涌出强度
+  var EVT_TIGER = 0.20;              // 龙虎榜：单日净流 > 20% × ADV
+  var EVT_ABNORMAL = 0.07;           // 异常波动问询：单日价格冲击 > 7%
+  var RESTRICT_FLOW = 0.50;          // 限制交易触发线：单日净流 > 50% × ADV
+  var RESTRICT_N = 2;                // RESTRICT_SPAN 个交易日内 2 次超限 ⇒ 限制交易
+  var RESTRICT_SPAN = 10;
+  var RESTRICT_DAYS = 5;             // 限制交易持续 5 个交易日
 
   var cache = {};                    // code@i → dayData（纯派生，可随时丢弃）
   var state = {
     seed: null,
-    hot: [],
-    pending: {}                      // code → 当日尚未结算的玩家净订单流（元，正=买）
+    hot: [],                         // 热集（≤8）：完整订单簿，逐日预计算
+    watch: [],                       // 轻量集（≤50）：只算净流 + Kyle 出清
+    pending: {},                     // code → 当日尚未结算的玩家净订单流（元，正=买）
+    events: [],                      // 反噬链事件（game.js 经 takeEvents() 取走并写日志）
+    restrict: {},                    // code → 限制交易解禁日 idx
+    restrictLog: {},                 // code → [[idx, |净流|/ADV], …] 超限记录
+    herd: {}                         // code → 最近一次跟风放大倍数（供 UI 展示）
   };
 
   /* ------------------------------------------------------------ 确定性随机 */
@@ -92,6 +133,10 @@ window.Micro = (function () {
     return LEVELS.indexOf(lv) !== -1 ? lv : 'std';
   }
   function levelParams() { return PARAMS[level()] || PARAMS.std; }
+  function herdGain() {
+    var g = HERD_GAIN[level()];
+    return (g === undefined) ? HERD_GAIN.std : g;
+  }
 
   /* ------------------------------------------------------------ 派生参数 */
 
@@ -147,45 +192,76 @@ window.Micro = (function () {
     return null;
   }
 
-  /* ------------------------------------------------------------ 代理行为（最小可用版） */
+  /* ------------------------------------------------------------ 玩家信号 */
+
+  /**
+   * 玩家净流的「参与率」（带符号，clamp ±1）——散户跟风的信号源。
+   * 未结算的当日净流 + 已沉淀的 carry 折算回当量净流。
+   */
+  function playerSignal(code, i) {
+    var adv = advNotional(code, i);
+    if (!(adv > 0)) return 0;
+    var pend = state.pending[code] || 0;
+    var eq = carryAt(code, i) * Math.max(1, adv);   // carry 折算成当量净流
+    return clamp((pend + eq) / adv, -1, 1);
+  }
+
+  /* ------------------------------------------------------------ 5 类代理（CP3 精细化） */
 
   /**
    * 单个代理在第 m 分钟的净委托量（股，正=买）。
-   * @returns {number}
+   * ctx = { mom, cumNet, part, mid, refPrice, pSig, sigmaMin }
    */
-  function agentFlow(a, seed, code, i, m, mom, cumNet, part) {
+  function agentFlow(a, seed, code, i, m, ctx) {
     var base = seed + '#agent#' + a + '#' + code + '#' + i + '#' + m;
-    var sgn = sign(mom) || 1;
+    var sgn = sign(ctx.mom) || 1;
+    var part = ctx.part;
+
     if (a === 'retail') {
-      // 散户：羊群（追随近期动量），小单
+      /* 散户：羊群（追随玩家净流 / 近期动量）+ 处置效应（浮盈就跑、浮亏死扛） */
       var u = hash01(base + '#u'), v = hash01(base + '#v');
-      var dir = (u < 0.62) ? sgn : -sgn;
-      var mag = part * 0.12 * (0.4 + 1.2 * v);
+      // 跟风：玩家参与率越高，散户方向越一致（跟随概率 0.5 → 0.85）
+      var herdP = 0.5 + Math.min(0.35, Math.abs(ctx.pSig) * 3);
+      var dir = (u < herdP) ? sgn : -sgn;
+      // 处置效应：以昨收为参考价
+      var pnl = ctx.refPrice > 0 ? (ctx.mid - ctx.refPrice) / ctx.refPrice : 0;
+      if (pnl > 0.004 && hash01(base + '#disp') < 0.35) dir = -1;                // 浮盈倾向了结
+      else if (pnl < -0.004 && dir < 0 && hash01(base + '#dl') < 0.45) dir = 1;  // 浮亏死扛（不愿割）
+      var mag = part * 0.12 * (0.4 + 1.2 * v) * (1 + Math.abs(ctx.pSig) * 2);
       return dir * mag;
     }
     if (a === 'hotmoney') {
-      // 游资：低频脉冲，大单，偏动量
-      if (hash01(base + '#on') > 0.12) return 0;
+      /* 游资：低频脉冲、大单、偏动量；尾盘隔日了结（昨日的仓今日平） */
+      if (hash01(base + '#on') > 0.12) {
+        // 收盘集合竞价窗口内：隔日了结，反向平掉昨日脉冲
+        if (m >= MINUTES - CLOSE_WIN && hash01(base + '#unw') < 0.35) {
+          return (-sgn) * part * 0.9 * (0.5 + hash01(base + '#uw'));
+        }
+        return 0;
+      }
       var d = (hash01(base + '#d') < 0.55) ? sgn : (hash01(base + '#d2') < 0.5 ? 1 : -1);
       var s = hash01(base + '#s');
       return (d || 1) * part * 1.3 * (0.5 + 1.5 * s);
     }
     if (a === 'inst') {
-      // 机构：稳定分批 + 反向回归（VWAP 意味）
+      /* 机构：VWAP 分批（日内均匀、越晚越轻）+ 反向回归 */
+      var slice = 1.6 - 0.6 * (m / MINUTES);
       var si = hash01(base + '#s');
-      return (-sgn) * part * 0.30 * (0.6 + 0.8 * si);
+      return (-sgn) * part * 0.30 * slice * (0.6 + 0.8 * si);
     }
     if (a === 'quant') {
-      // 量化：高频小单，动量与反转混合
+      /* 量化：高频小单，动量与反转混合；波动越大越活跃 */
       var uq = hash01(base + '#u');
       var sq = hash01(base + '#s');
       var dq = (uq < 0.5) ? sgn : -sgn;
-      return (dq || 1) * part * 0.16 * (0.3 + 1.0 * sq);
+      var act = 1 + Math.min(1.5, ctx.sigmaMin / 0.002);
+      return (dq || 1) * part * 0.16 * act * (0.3 + 1.0 * sq);
     }
-    // 做市商：库存偏好 —— 反向对冲累计净流
-    var inv = sign(cumNet);
+    /* 做市商：双边报价 + 库存偏好反向对冲；波动越大越保守（价差放大 ⇒ 对冲力度下降） */
+    var inv = sign(ctx.cumNet);
     var sm = hash01(base + '#s');
-    return (-inv) * part * 0.10 * (0.4 + 0.8 * sm);
+    var widen = 1 / (1 + Math.min(1.5, ctx.sigmaMin / 0.002));
+    return (-inv) * part * 0.10 * widen * (0.4 + 0.8 * sm);
   }
 
   function minuteLabel(m) {
@@ -199,7 +275,7 @@ window.Micro = (function () {
   /** 运行(code, i)的确定性日内模拟，产出逐笔 + 分时 + 代理净流入。 */
   function simulate(code, i) {
     var out = { code: code, i: i, ticks: [], minutes: [], agents: [], mid: 0, spread: 0,
-      prevClose: 0, open: 0, sigma: 0.015, adv: 0 };
+      prevClose: 0, open: 0, sigma: 0.015, adv: 0, close: 0 };
     var b = rawAt(code, i);
     if (!b) return out;
 
@@ -212,16 +288,20 @@ window.Micro = (function () {
     var adv = advShares(code, i);
     var part = Math.max(1, adv / MINUTES);
     var seed = seedOf();
+    var pSig = playerSignal(code, i);
 
     var mid = open, cumNet = 0, mom = 0;
+    var ctx = { mom: 0, cumNet: 0, part: part, mid: open, refPrice: pc,
+      pSig: pSig, sigmaMin: sigmaMin };
     var agg = {};
     AGENTS.forEach(function (a) { agg[a] = { net: 0, amount: 0, orders: 0 }; });
 
     for (var m = 0; m < MINUTES; m++) {
       var mo = mid, mh = -Infinity, ml = Infinity, mv = 0, first = null, last = null;
+      ctx.mom = mom; ctx.cumNet = cumNet; ctx.mid = mid;
       for (var ai = 0; ai < AGENTS.length; ai++) {
         var a = AGENTS[ai];
-        var flow = agentFlow(a, seed, code, i, m, mom, cumNet, part);
+        var flow = agentFlow(a, seed, code, i, m, ctx);
         if (!flow) continue;
         var dln = clamp(LAMBDA * flow / part, -0.01, 0.01);
         mid = mid * Math.exp(dln);
@@ -236,14 +316,42 @@ window.Micro = (function () {
         last = exec;
         if (exec > mh) mh = exec;
         if (exec < ml) ml = exec;
-        mv += size;
+        mv += size;               // 成交量守恒：逐笔 size 之和 = 分钟量（CP1 已验收）
       }
       if (first === null) { first = last = mo; mh = ml = mo; }
       out.minutes.push({ m: m, t: minuteLabel(m), o: first, h: mh, l: ml, c: last, v: mv });
       mom = 0.7 * mom + 0.3 * ((last - mo) / (mo || 1));
     }
 
+    /* ---- CP3-1 收盘集合竞价校准 ----
+       日内路径完全由撮合内生涌现；只在收盘前 CLOSE_WIN 分钟施加一段末端对冲（集合竞价），
+       把日内净流残差归零 ⇒ 分时末点严格收敛到当日收盘（锚 A = raw.c）。
+       成交量字段一律不动 ⇒ volTick === volMinute 守恒不变。 */
+    var A = (b.c > 0) ? b.c : 0;
+    var lastC = out.minutes.length ? out.minutes[out.minutes.length - 1].c : 0;
+    if (A > 0 && lastC > 0) {
+      var drift = Math.log(A / lastC);
+      var w0 = Math.max(0, MINUTES - CLOSE_WIN);
+      for (var mi = 0; mi < out.minutes.length; mi++) {
+        var mm2 = out.minutes[mi];
+        var f = (mm2.m < w0) ? 1 : Math.exp(drift * (mm2.m - w0 + 1) / CLOSE_WIN);
+        if (f === 1) continue;
+        mm2.o = round2(mm2.o * f);
+        mm2.h = round2(mm2.h * f);
+        mm2.l = round2(mm2.l * f);
+        mm2.c = round2(mm2.c * f);
+      }
+      for (var ti = 0; ti < out.ticks.length; ti++) {
+        var tk = out.ticks[ti];
+        var ft = (tk.m < w0) ? 1 : Math.exp(drift * (tk.m - w0 + 1) / CLOSE_WIN);
+        if (ft === 1) continue;
+        tk.price = Math.max(0.01, round2(tk.price * ft));
+      }
+      mid = mid * Math.exp(drift);
+    }
+
     out.mid = mid;
+    out.close = A;
     out.prevClose = pc;
     out.open = open;
     out.sigma = sigma;
@@ -269,7 +377,7 @@ window.Micro = (function () {
   /* ------------------------------------------------------------ 引力锚（OU）定价 */
   /*   ln P = ln A + carry ；A = raw.c × bfactorAt × swanFactor（由 game.js 组合）
    *   carry_i = clamp( carry_{i-1}·exp(−θ_eff) + imp_i , ±CAP )
-   *   imp_i   = Kyle：λ_sqrt(level)·sign(flow_i)·sqrt(|flow_i|/ADV)
+   *   imp_i   = Kyle λ × 跟风放大：λ·sqrt(max(0,|X|/ADV − PERM_MIN)) × (1 + HERD_GAIN·ignite)
    *   θ_eff   = (ln2/H)·g_liq(ADV)·h(|carry|)
    *   ---- carry 的唯一来源是玩家净订单流；NPC 净流按锚定校准，贡献 0 ----
    */
@@ -306,9 +414,9 @@ window.Micro = (function () {
     return (h && h.length) ? h[h.length - 1][1] : 0;
   }
 
-  /** 流动性修正 g_liq：ADV 越大回归越强（上限 1.6 / 下限 0.6）。 */
+  /** 流动性修正 g_liq：ADV 越大回归越强。CP3-0：夹到 [0.75, 1.333] 令半衰期带宽恒成立。 */
   function gLiq(advN) {
-    return clamp(0.6 + 0.4 * Math.log10(Math.max(1, advN) / ADV_REF), 0.6, 1.6);
+    return clamp(0.6 + 0.4 * Math.log10(Math.max(1, advN) / ADV_REF), G_LIQ_MIN, G_LIQ_MAX);
   }
 
   /** 偏离放大回归强度 h(|carry|)：偏离越大回归越强（上限 6）。 */
@@ -323,19 +431,37 @@ window.Micro = (function () {
     return (Math.LN2 / P.H) * gLiq(advNotional(code, i)) * hOf(carryVal, sigma);
   }
 
-  /**
-   * Kyle λ 冲击项（对数）：imp = λ·sign(X)·sqrt(|X|/ADV)。
-   * 采用「吸收门限」形式：先扣掉被盘口当日吸收的 PERM_MIN·ADV，剩余部分才产生永久冲击。
-   * 于是小额委托（如 1 手）严格 imp === 0 ⇒ carry≡0 ⇒ factor 精确 === 1（IEEE 精确回退）。
-   */
+  /** Kyle λ 冲击项（对数，仅自有冲击）：imp = λ·sqrt(max(0, |X|/ADV − PERM_MIN))。 */
   function kyleImp(code, i, flowNotional) {
     if (!flowNotional || !isFinite(flowNotional)) return 0;
     var adv = advNotional(code, i);
     if (!(adv > 0)) return 0;
     var P = levelParams();
     var part = Math.abs(flowNotional) / adv - PERM_MIN;
-    if (part <= 0) return 0;                    // 被吸收 ⇒ 无永久冲击（严格零）
+    if (part <= 0) return 0;                    // 被盘口吸收 ⇒ 无永久冲击（严格零）
     return P.lam * sign(flowNotional) * Math.sqrt(part);
+  }
+
+  /**
+   * 跟风放大倍数（CP3-4）：散户跟随玩家净流，把冲击放大到可感知量级。
+   * ignite 随「超出吸收门限的参与率」线性上升，IGNITE_REF 处完全点燃。
+   * @returns {number} ≥ 1
+   */
+  function herdAmp(code, i, flowNotional) {
+    if (!flowNotional || !isFinite(flowNotional)) return 1;
+    var adv = advNotional(code, i);
+    if (!(adv > 0)) return 1;
+    var partEff = Math.abs(flowNotional) / adv - PERM_MIN;
+    if (partEff <= 0) return 1;                 // 被吸收 ⇒ 无跟风可点燃
+    var ignite = clamp(partEff / IGNITE_REF, 0, 1);
+    return 1 + herdGain() * ignite;
+  }
+
+  /** 含跟风放大的冲击项（对数）。 */
+  function impWith(code, i, flowNotional) {
+    var own = kyleImp(code, i, flowNotional);
+    if (own === 0) return 0;
+    return own * herdAmp(code, i, flowNotional);
   }
 
   /**
@@ -349,10 +475,10 @@ window.Micro = (function () {
     var idx = currentIdx();
     var ii = (i === undefined) ? idx : i;
     var c = carryAt(code, ii);
-    // 当前日叠加「尚未结算」的玩家净流冲击，使玩家当日即看到价格反应
+    // 当前日叠加「尚未结算」的玩家净流冲击（含跟风放大），使玩家当日即看到价格反应
     if (ii === idx) {
       var pend = state.pending[code];
-      if (pend) c += kyleImp(code, ii, pend);
+      if (pend) c += impWith(code, ii, pend);
     }
     if (c === 0) return 1;
     return Math.exp(c);
@@ -360,7 +486,7 @@ window.Micro = (function () {
 
   /* ------------------------------------------------------------ 公共读取 */
 
-  /** 分时序列（= 逐笔按分钟聚合，内生涌现）。 */
+  /** 分时序列（= 逐笔按分钟聚合，内生涌现；末点经收盘集合竞价收敛到当日收盘）。 */
   function minute(code, i) { return dayData(code, i).minutes; }
 
   /** 逐笔成交（tick prints）。 */
@@ -392,6 +518,89 @@ window.Micro = (function () {
     return d.prevClose || 0;
   }
 
+  /** 轻量集口径（≤50 只）：只算净流 + Kyle 出清，不做撮合。 */
+  function light(code, i) {
+    var d = dayData(code, i);
+    var net = 0, amt = 0;
+    for (var k = 0; k < d.agents.length; k++) { net += d.agents[k].net; amt += d.agents[k].amount; }
+    return { code: code, i: i, net: net, amount: amt, adv: advNotional(code, i),
+      imp: kyleImp(code, i, state.pending[code] || 0) };
+  }
+
+  /**
+   * 可拉抬弹性（CP3-5）：0~100 分。由 ADV（流通盘代理）决定 —— 小盘易拉、大盘难拉。
+   * 同一 X 元，得分越高偏离越大。
+   */
+  function elasticity(code, i) {
+    var adv = advNotional(code, i);
+    if (!(adv > 0)) return 0;
+    // ADV 从 1e10 元（极难拉）到 1e8 元（极易拉）对数映射到 0~100
+    var s = clamp((Math.log10(1e10) - Math.log10(adv)) / (Math.log10(1e10) - Math.log10(1e8)), 0, 1);
+    return Math.round(s * 100);
+  }
+
+  /** 最近一次跟风放大倍数（供 UI 展示「散户正在跟进来」）。 */
+  function herdOf(code) {
+    var h = state.herd[code];
+    return (h === undefined) ? 1 : h;
+  }
+
+  /* ------------------------------------------------------------ 反噬链（CP3-4） */
+
+  /**
+   * 反噬链判定：把玩家净流折算为参与率并登记，超限则触发监管事件。
+   * @param {string} code
+   * @param {number} idx  交易日下标
+   * @param {number} flow 当日玩家净流（元）
+   */
+  function backlash(code, idx, flow) {
+    var adv = advNotional(code, idx);
+    if (!(adv > 0) || !flow) return;
+    var part = Math.abs(flow) / adv;
+
+    if (part > EVT_TIGER) {
+      state.events.push({ i: idx, code: code, kind: 'tiger', part: +part.toFixed(4),
+        text: '登上龙虎榜：单日净' + (flow > 0 ? '买入' : '卖出') +
+          '占成交额 ' + (part * 100).toFixed(1) + '%，市场开始盯着你' });
+    }
+    var eff = Math.abs(impWith(code, idx, flow));
+    if (eff > EVT_ABNORMAL) {
+      state.events.push({ i: idx, code: code, kind: 'abnormal', part: +part.toFixed(4),
+        text: '交易所下发异常波动问询：当日价格偏离基准 ' + (eff * 100).toFixed(2) + '%' });
+    }
+    if (part > RESTRICT_FLOW) {
+      var log = state.restrictLog[code] || (state.restrictLog[code] = []);
+      log.push([idx, part]);
+      var recent = 0;
+      for (var k = 0; k < log.length; k++) if (idx - log[k][0] < RESTRICT_SPAN) recent++;
+      if (recent >= RESTRICT_N && !(state.restrict[code] > idx)) {
+        state.restrict[code] = idx + RESTRICT_DAYS;
+        state.events.push({ i: idx, code: code, kind: 'restrict', part: +part.toFixed(4),
+          text: '被限制交易 ' + RESTRICT_DAYS + ' 个交易日：短期内多次大额申报，账户已被重点监控' });
+      }
+    }
+  }
+
+  /** 该标的当前是否处于限制交易期。 */
+  function restricted(code, i) {
+    var until = state.restrict[code];
+    if (!until) return false;
+    var ii = (i === undefined) ? currentIdx() : i;
+    return ii < until;
+  }
+
+  /** 取走并清空待播报的反噬链事件（game.js 在 stepDay 后调用并写日志）。 */
+  function takeEvents() {
+    var e = state.events;
+    state.events = [];
+    return e;
+  }
+
+  /** 只读：待播报事件（不消费）。 */
+  function events(code) {
+    return state.events.filter(function (e) { return !code || e.code === code; });
+  }
+
   /* ------------------------------------------------------------ 玩家流 & 逐日递推 */
 
   /**
@@ -403,12 +612,17 @@ window.Micro = (function () {
     if (!enabled()) return 0;
     if (!code || !X || !isFinite(X) || X === 0) return 0;
     state.pending[code] = (state.pending[code] || 0) + X;
+    /* 玩家流改变了散户跟风信号 ⇒ 当日分时缓存失效，重算后玩家可在分时图上看到跟风 */
+    delete cache[code + '@' + currentIdx()];
     return state.pending[code];
   }
 
   /**
-   * 逐日推进（在 game.js stepDay 中于 Market.next(1) 之后调用）：
-   * 对每个有过 carry / 当日有玩家流的标的，做一次 OU 递推并落盘到 G.microCarry。
+   * 逐日推进（game.js 在 stepDay 里于 Market.next(1) 之后调用）：
+   * ① 每个有 carry / 当日有玩家流的标的做一次 OU 递推并落盘 G.microCarry
+   * ② 获利盘涌出（偏离过大且当日无新玩家流时的反向了结压力）
+   * ③ 反噬链判定（龙虎榜 / 异常波动问询 / 限制交易）
+   * ④ 热集（≤8）完整订单簿预计算，把 UI 冷启动摊到日推进里
    */
   function step(G, i) {
     if (!enabled()) { state.pending = {}; return; }
@@ -425,15 +639,30 @@ window.Micro = (function () {
       var flow = state.pending[code] || 0;
       if (prev === 0 && flow === 0) continue;
       var sigma = dailyVol(code, idx);
+
+      /* ① 玩家自有冲击 + 跟风放大 */
+      var imp = impWith(code, idx, flow);
+      if (imp !== 0) state.herd[code] = herdAmp(code, idx, flow);
+
+      /* ② 获利盘涌出：偏离过大且当日无新玩家流时，获利/解套盘反向了结 */
+      if (flow === 0 && Math.abs(prev) > PROFIT_TAKE) {
+        imp -= sign(prev) * PROFIT_TAKE_K * (Math.abs(prev) - PROFIT_TAKE);
+      }
+
       var th = thetaEff(code, idx, sigma, prev);
-      var imp = kyleImp(code, idx, flow);
       var next = clamp(prev * Math.exp(-th) + imp, -CAP, CAP);
       if (!isFinite(next)) next = prev;
       var h = m[code] || (m[code] = []);
       h.push([idx, next]);
       if (h.length > HIST_MAX) h.splice(0, h.length - HIST_MAX);
+
+      /* ③ 反噬链 */
+      backlash(code, idx, flow);
     }
     state.pending = {};
+
+    /* ④ 热集：完整订单簿预计算（≤8 只） */
+    for (var hi = 0; hi < state.hot.length; hi++) minute(state.hot[hi], idx);
   }
 
   /* ------------------------------------------------------------ 生命周期 */
@@ -441,7 +670,12 @@ window.Micro = (function () {
   function reset(seed) {
     state.seed = (seed === undefined) ? null : seed;
     state.hot = [];
+    state.watch = [];
     state.pending = {};
+    state.events = [];
+    state.restrict = {};
+    state.restrictLog = {};
+    state.herd = {};
     cache = {};
     return true;
   }
@@ -451,7 +685,8 @@ window.Micro = (function () {
     for (var k in (m || {})) n++;
     return {
       stage: STAGE, enabled: enabled(), level: level(), seed: state.seed,
-      hot: state.hot.slice(), cacheSize: Object.keys(cache).length,
+      hot: state.hot.slice(), watch: state.watch.slice(),
+      cacheSize: Object.keys(cache).length,
       minutesPerDay: MINUTES, agents: AGENTS.slice(),
       carryCodes: n, pendingCodes: Object.keys(state.pending).length
     };
@@ -467,6 +702,11 @@ window.Micro = (function () {
     state.hot = (codes || []).slice(0, 8);
     return state.hot.length;
   }
+  /** 轻量集（≤50 只）：只算净流 + Kyle 出清，不做撮合。 */
+  function setWatch(codes) {
+    state.watch = (codes || []).slice(0, 50);
+    return state.watch.length;
+  }
 
   function init(G, deps) { return true; }
 
@@ -478,6 +718,11 @@ window.Micro = (function () {
     PARAMS: PARAMS,
     CAP: CAP,
     PERM_MIN: PERM_MIN,
+    HERD_GAIN: HERD_GAIN,
+    IGNITE_REF: IGNITE_REF,
+    G_LIQ_MIN: G_LIQ_MIN,
+    G_LIQ_MAX: G_LIQ_MAX,
+    CLOSE_WIN: CLOSE_WIN,
     /* 配置 */
     enabled: enabled, level: level,
     /* 定价 */
@@ -485,11 +730,15 @@ window.Micro = (function () {
     /* 玩家流 */
     applyPlayerFlow: applyPlayerFlow,
     /* 生命周期 */
-    reset: reset, getState: getState, setOpt: setOpt, setHot: setHot,
+    reset: reset, getState: getState, setOpt: setOpt, setHot: setHot, setWatch: setWatch,
     init: init, step: step,
     /* 微观读取 */
-    minute: minute, ticks: ticks, book: book, agents: agents, anchor: anchor,
+    minute: minute, ticks: ticks, book: book, agents: agents, anchor: anchor, light: light,
+    /* CP3：跟风 / 反噬链 / 弹性 */
+    herdOf: herdOf, herdAmp: herdAmp, events: events, takeEvents: takeEvents,
+    restricted: restricted, elasticity: elasticity,
     /* 派生量（供测试/UI 复用同一口径） */
-    advNotional: advNotional, kyleImp: kyleImp, thetaEff: thetaEff
+    advNotional: advNotional, kyleImp: kyleImp, thetaEff: thetaEff, impWith: impWith,
+    playerSignal: playerSignal
   };
 })();
