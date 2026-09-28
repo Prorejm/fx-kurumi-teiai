@@ -6,15 +6,26 @@
   1) 腾讯财经  ifzq.gtimg.cn          覆盖 A股/港股/ETF/债券/逆回购/可转债/指数
   2) 东方财富  push2his.eastmoney.com  覆盖最广, 含真实美股; 限流严格, 需强节流
   3) 新浪财经  money.finance.sina.com.cn  覆盖 A股/可转债/逆回购/ETF/商品/指数
+  4) 新浪期货  stock.finance.sina.com.cn  InnerFuturesNewService 主力连续日线 (JSONP)
+               已实测禁区: 腾讯不支持期货(nf_* 等 11 种形态全灭, 返回 v_pv_none_match)
+  5) 数字资产  data-api.binance.vision  日线/实时 (CORS `*`, 运行期可直连)
+               已实测禁区: api.binance.com 及 api1/2/3 全系不通, 勿换回
+               备用: api.gateio.ws (字段顺序与直觉相反, 见 src_gateio 注释)
+
+独立日期轴 (T03): 期货按各自交易日历、加密 7x24 按 UTC 00:00 收线,
+均不并入 all_dates 主日历; 落盘时按「区间聚合」重采样, 避免周末行情被
+当成停牌前向填充而丢失。主日历本身保持不变。
 
 输出: <项目根>/data/snapshot.js
 """
+import datetime
 import html
 import json
 import os
 import random
 import re
 import ssl
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +40,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 DAYS = 520
 MIN_ROWS = 30          # 少于该行数视为抓取失败
 STALE_TOL = 8          # 末个交易日早于全局末日前 N 个交易日 -> 视为退市/强赎, 剔除
+
+# ---- T03 另类品种: 独立日期轴 ----
+FU_DAYS = 640          # 期货主力连续: 主日历 520 交易日 ~= 2 年, 期货日历取 640 根兜底
+CR_DAYS = 1000         # 数字资产 7x24: 2 年 ~= 730 个 UTC 日, 取接口上限 1000 后按窗口裁切
+ROLL_GAP = 0.08        # 主力连续换月跳空阈值 (见 roll_points 注释)
+EM_INTERVAL = 4.0      # 东财间隔: 2.2s 实测偏激进(IP 级限流), 加大到 4.0s
+EM_MAX_FAIL = 3        # 东财连续失败 N 次 -> 快速降级, 放弃整轮
 
 # 代码 -> (名称, 板块/行业, 市场, 涨跌停幅度)
 POOL = [
@@ -162,6 +180,7 @@ POOL = [
     # ===== 基金 / 固收 / REITs / 商品 (场内 ETF / LOF / 债券 / REIT) =====
     # 宽基指数
     ("sh510300", "沪深300ETF", "指数", "fd", 10),
+    ("sh510050", "50ETF", "指数", "fd", 10),      # T03: 期权标的(上交所 50ETF 期权)
     ("sz159915", "创业板ETF", "指数", "fd", 10),
     ("sh510500", "中证500ETF", "指数", "fd", 10),
     ("sh510880", "红利ETF", "红利", "fd", 10),
@@ -363,6 +382,69 @@ US_LIST = [
     ("usBABA", "阿里巴巴ADR", "电商", 80.0, 0.030, 0.0002, "BABA"),
 ]
 
+# =====================================================================
+#  T03 · 四类另类投资品种 (期货 / 期权 / 数字资产 / 私募·信托 / 另类)
+# ---------------------------------------------------------------------
+#  铁律: 规则常量一律不进 snapshot —— 合约乘数、保证金率、权利金参数、
+#  起投门槛、锁定期、票息、敲入敲出线 均由前端 game.js 持有。
+#  快照只承载: 序列(series) + 元信息(meta) + 独立日期轴(ax) + 换月点(rol)。
+# =====================================================================
+
+# 期货主力连续 —— 新浪 InnerFuturesNewService (UTF-8 JSONP, 需剥壳)
+# 实测: AU0/AG0/SC0/RB0/CU0/I0/M0 七个全部可用, 接口返回全量历史(AU0 4561 根)
+# (code, 名称, 行业, market, 新浪symbol, 涨跌停%)
+FUT_LIST = [
+    ("futAU", "沪金主力", "贵金属", "fut", "AU0", 9),
+    ("futAG", "沪银主力", "贵金属", "fut", "AG0", 11),
+    ("futSC", "原油主力", "能源", "fut", "SC0", 9),
+    ("futRB", "螺纹钢主力", "黑色", "fut", "RB0", 8),
+    ("futCU", "沪铜主力", "有色", "fut", "CU0", 7),
+    ("futI", "铁矿石主力", "黑色", "fut", "I0", 9),
+    ("futM", "豆粕主力", "农产品", "fut", "M0", 7),
+]
+
+# 期货抓取失败时的合成参数 (参考价 / 日波动), 必须逐品种给出, 不能共用一套
+FUT_SYNTH = {
+    "futAU": (560.0, 0.012),      # 元/克
+    "futAG": (7500.0, 0.018),     # 元/千克
+    "futSC": (552.0, 0.022),      # 元/桶
+    "futRB": (3210.0, 0.015),     # 元/吨
+    "futCU": (78000.0, 0.013),    # 元/吨
+    "futI": (780.0, 0.020),       # 元/吨
+    "futM": (3360.0, 0.014),      # 元/吨
+}
+
+# 数字资产 —— Binance data-api (实测 CORS `*`, 运行期亦可直连), 备 Gate.io
+# 计价: 接口为 USDT 计价, 构建期用真实 USD/CNY 在岸价折算为人民币
+# (code, 名称, 行业, market, Binance symbol, Gate pair, 合成基准¥, 合成日波动)
+CRY_LIST = [
+    ("cryBTC", "比特币", "数字资产", "cry", "BTCUSDT", "BTC_USDT", 460000.0, 0.040),
+    ("cryETH", "以太坊", "数字资产", "cry", "ETHUSDT", "ETH_USDT", 23000.0, 0.045),
+]
+
+# 期权 —— Q7: 期权链运行时由 BSM 生成, 不落盘; 快照只存「标的 ETF」的真实序列
+# (code, 名称, 行业, market, 底层 ETF 代码)
+OPT_LIST = [
+    ("opt510300", "300ETF期权", "期权", "opt", "sh510300"),
+    ("opt510050", "50ETF期权", "期权", "opt", "sh510050"),
+]
+
+# 私募 / 信托 (PM) —— 非净值型, 锁定期内不可赎回; 序列为「应计单位净值」
+# (code, 名称, 行业, market, 年化利率)
+PM_PRODUCTS = [
+    ("pmFUND", "私募固收", "私募", "pm", 0.055),
+    ("pmTRUST", "信托计划", "信托", "pm", 0.065),
+]
+
+# 另类 / 结构性 (ALT) —— 序列 = 挂钩标的的真实序列, 收益规则(敲入敲出/参与率)在前端
+# (code, 名称, 行业, market, 挂钩标的)
+ALT_PRODUCTS = [
+    ("altSNOW", "雪球·中证500", "结构化", "alt", "sz399905"),
+    ("altLINK", "挂钩沪深300", "结构化", "alt", "sh000300"),
+    ("altGOLD", "实物金条", "贵金属", "alt", "futAU"),
+    ("altACC", "银行积存金", "贵金属", "alt", "futAU"),
+]
+
 # 合规财经 RSS (构建期烘焙为 SNAPSHOT.news)
 RSS_FEEDS = [
     ("东方财富", "https://rss.eastmoney.com/rss_partener.xml", 60),
@@ -547,6 +629,202 @@ def src_sina_us(ticker, n):
         return None
 
 
+# ---------------- 期货 (新浪, 独立日期轴 FU) ----------------
+def _jsonp_peel(txt):
+    """新浪期货 JSONP 剥壳。
+    实测原文本体: /*<script>location.href='//sina.com';</script>*/\\nvar t=([...])
+    故不能整体 json.loads, 需按 '([' ... '])' 定位后再解析 (UTF-8, 非 GBK)。"""
+    i, j = txt.find("(["), txt.rfind("])")
+    if i < 0 or j < 0:
+        return None
+    try:
+        return json.loads(txt[i + 1:j + 1])
+    except Exception:
+        return None
+
+
+def src_sina_futures(symbol, n):
+    """新浪期货主力连续日线。字段 d,o,h,l,c,v,p(持仓),s(结算)。
+    接口返回全量历史(AU0 实测 4561 根 ≈520KB), 构建期只取末 n 根以控体积。"""
+    u = ("https://stock.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/"
+         f"InnerFuturesNewService.getDailyKLine?symbol={symbol}")
+    try:
+        raw = _open(u, "https://finance.sina.com.cn/", timeout=30)
+        if _looks_blocked(raw):
+            return None
+        arr = _jsonp_peel(raw.decode("utf-8", "ignore"))
+        if not isinstance(arr, list):
+            return None
+        rows = []
+        for r in arr:
+            if not r.get("d") or not r.get("c"):
+                continue
+            rows.append([r["d"][:10], r["o"], r["c"], r["h"], r["l"], r.get("v", 0)])
+        return rows[-n:] if len(rows) >= MIN_ROWS else None
+    except Exception:
+        return None
+
+
+def src_sina_futures_rt(symbol):
+    """新浪期货实时 (GB18030, 必须带 Referer)。实测 44 段。
+    无 CORS -> 浏览器运行期拿不到, 仅构建期使用(烘焙校验/对账)。
+    关键段位: 0名称 1时间 2开 3高 4低 8最新 10昨结算 13成交量 14持仓 17日期"""
+    u = f"https://hq.sinajs.cn/list=nf_{symbol}"
+
+    def _num(seg, k):
+        try:
+            v = float(seg[k])
+            return v if v == v else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        txt = _open(u, "https://finance.sina.com.cn/", timeout=20).decode("gb18030", "ignore")
+        if '="' not in txt:
+            return None
+        seg = txt.split('="', 1)[1].split('"')[0].split(",")
+        if len(seg) < 18:
+            return None
+        return {"name": seg[0], "time": seg[1], "open": _num(seg, 2),
+                "high": _num(seg, 3), "low": _num(seg, 4), "last": _num(seg, 8),
+                "presettle": _num(seg, 10), "vol": _num(seg, 13),
+                "oi": _num(seg, 14), "date": seg[17]}
+    except Exception:
+        return None
+
+
+# ---------------- 数字资产 (独立日期轴 CR, UTC 00:00 收线) ----------------
+def src_binance_dataapi(symbol, n):
+    """Binance data-api 日线。实测可用: api.binance.com 全系不通, 必须用 data-api.binance.vision。
+    响应 CORS `*`, 故运行期(实盘同步)也能直连。kline=[openTime,o,h,l,c,v,closeTime,...]
+    日线按 UTC 00:00 收线 -> 日期取 openTime 的 UTC 日期。"""
+    n = max(1, min(int(n), 1000))
+    u = (f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}"
+         f"&interval=1d&limit={n}")
+    try:
+        raw = _open(u, "https://www.binance.com/", timeout=25)
+        if _looks_blocked(raw):
+            return None
+        arr = json.loads(raw.decode("utf-8", "ignore"))
+        if not isinstance(arr, list):
+            return None
+        rows = []
+        for r in arr:
+            d = datetime.datetime.fromtimestamp(
+                r[0] / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+            rows.append([d, r[1], r[4], r[2], r[3], r[5]])     # d,o,c,h,l,v
+        return rows if len(rows) >= MIN_ROWS else None
+    except Exception:
+        return None
+
+
+def src_gateio(pair, n):
+    """Gate.io 现货日线(备用源)。字段顺序与直觉相反:
+    [ts, 报价成交量, close, high, low, open, baseVol, closed] —— 第 3 位是收盘而非开盘。"""
+    n = max(1, min(int(n), 1000))
+    u = (f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={pair}"
+         f"&interval=1d&limit={n}")
+    try:
+        raw = _open(u, "https://www.gate.io/", timeout=25)
+        if _looks_blocked(raw):
+            return None
+        arr = json.loads(raw.decode("utf-8", "ignore"))
+        if not isinstance(arr, list):
+            return None
+        rows = []
+        for r in arr:
+            d = datetime.datetime.fromtimestamp(
+                int(r[0]), datetime.timezone.utc).strftime("%Y-%m-%d")
+            rows.append([d, r[5], r[2], r[3], r[4], r[6]])     # d,o,c,h,l,v
+        return rows if len(rows) >= MIN_ROWS else None
+    except Exception:
+        return None
+
+
+def src_usdcny():
+    """美元/人民币在岸价(新浪外汇)。腾讯 fx_susdcny 实测返回 v_pv_none_match, 不可用。
+    用于把 USDT 计价折算为人民币计价(Q1: 全作品统一人民币)。"""
+    u = "https://hq.sinajs.cn/list=fx_susdcny"
+    try:
+        txt = _open(u, "https://finance.sina.com.cn/", timeout=15).decode("gb18030", "ignore")
+        if '="' not in txt:
+            return None
+        seg = txt.split('="', 1)[1].split('"')[0].split(",")
+        v = float(seg[1])
+        return v if 3.0 < v < 12.0 else None      # 合理性护栏
+    except Exception:
+        return None
+
+
+# ---------------- 换月跳空清洗 & 独立日期轴重采样 ----------------
+def roll_points(rows, thr=ROLL_GAP):
+    """主力连续(AU0/RB0...)换月日的非经济性跳空点, 返回 [date, ...]。
+
+    判据取「隔夜跳空 |今开/昨收 − 1|」而非「日收益 |今收/昨收 − 1|」:
+      换月是旧合约换到新合约的拼接, 价差在开盘瞬间一次性体现 -> 隔夜跳空大;
+      而真实剧烈波动是日内走出来的 -> 隔夜跳空小、日收益大。
+    实测反例(若按日收益剔除会误杀真实行情):
+      沪金 AU0 2026-02-02 日收益 13.16%, 但隔夜跳空仅 1.84% -> 真实日内波动, 不是换月。
+    实测正例: 豆粕 M0 2023-12-11 隔夜跳空 13.83%; 白银 AG0 2026-02-24 隔夜跳空 13.00%。
+    """
+    out = []
+    for i in range(1, len(rows)):
+        try:
+            pc = float(rows[i - 1][2])
+            o = float(rows[i][1])
+        except Exception:
+            continue
+        if pc > 0 and abs(o / pc - 1) > thr:
+            out.append(rows[i][0])
+    return out
+
+
+def resample_axis(ax_dates, rows, main_dates, scale):
+    """把独立日期轴上的序列「区间聚合」重采样到主日历, 返回定长 arr(×5)。
+
+    区间 = (上一主日历日, 当日]。这样加密的周末行情会被聚合进周一那根 K 的
+    O/H/L/C 与成交量里, 而不是被当成停牌做前向填充而丢失 —— 这正是
+    「独立日期轴」要防的错位。没有新行情的日子(如期货休市)才前向平盘。
+    """
+    arr = [0] * (len(main_dates) * 5)
+    p = 0
+    prev_c = None
+    for i, to in enumerate(main_dates):
+        frm = main_dates[i - 1] if i else ""
+        o = h = l = c = None
+        v = 0.0
+        n = 0
+        while p < len(ax_dates) and ax_dates[p] <= to:
+            d = ax_dates[p]
+            r = rows.get(d)
+            p += 1
+            if not r or d <= frm:
+                continue
+            oo, cc, hh, ll, vv = r
+            if cc is None or cc <= 0:
+                continue
+            if n == 0:
+                o, h, l = oo, hh, ll
+            else:
+                h = max(h, hh)
+                l = min(l, ll)
+            c = cc
+            v += vv
+            n += 1
+        b = i * 5
+        if n:
+            arr[b] = int(round(o * scale))
+            arr[b + 1] = int(round(h * scale))
+            arr[b + 2] = int(round(l * scale))
+            arr[b + 3] = int(round(c * scale))
+            arr[b + 4] = int(round(v))
+            prev_c = arr[b + 3]
+        elif prev_c is not None:
+            arr[b] = arr[b + 1] = arr[b + 2] = arr[b + 3] = prev_c
+            arr[b + 4] = 0
+    return arr
+
+
 # ---------------- 构建期烘焙合规财经 RSS ----------------
 def fetch_news():
     items = []
@@ -605,18 +883,33 @@ def fetch_tencent_pass(codes):
     return out
 
 
-def fetch_serial_pass(codes, fn, label, interval):
-    """东财/新浪: 严格串行 + 间隔, 避免被限流断连。"""
+def fetch_serial_pass(codes, fn, label, interval, max_consec_fail=0, retries=2):
+    """东财/新浪: 严格串行 + 间隔, 避免被限流断连。
+
+    东财是 IP 级限流炸弹(实测连续请求后连茅台对照组都 RemoteDisconnected),
+    故对东财额外开: 指数退避 + 连续失败 N 次即快速降级放弃整轮。
+    max_consec_fail=0 表示不做快速降级(新浪等温和源沿用旧行为)。
+    """
     out = {}
+    consec = 0
     for i, c in enumerate(codes):
         rows = None
-        for attempt in range(2):
+        wait = interval
+        for _ in range(retries + 1):
             rows = fn(c, DAYS)
             if rows:
                 break
-            time.sleep(interval * 2)
+            time.sleep(wait)
+            wait = min(wait * 2, 60)          # 指数退避
         if rows:
             out[c] = rows
+            consec = 0
+        else:
+            consec += 1
+            if max_consec_fail and consec >= max_consec_fail:
+                print(f"    {label} 连续 {consec} 次失败 -> 快速降级, "
+                      f"放弃剩余 {len(codes) - i - 1} 项", flush=True)
+                break
         if (i + 1) % 5 == 0 or i + 1 == len(codes):
             print(f"    {label} {i+1}/{len(codes)} 成功 {len(out)}", flush=True)
         time.sleep(interval)
@@ -639,7 +932,7 @@ def main():
     tick_of = {u[0]: u[6] for u in US_LIST}
 
     # ---- pass 1: 腾讯 A股/港股/ETF/债券/可转债/逆回购/指数 ----
-    print("\n[1/5] 腾讯财经 (A股/港股/ETF/债券/可转债/逆回购/指数) ...", flush=True)
+    print("\n[1/8] 腾讯财经 (A股/港股/ETF/债券/可转债/逆回购/指数) ...", flush=True)
     p1 = fetch_tencent_pass(pool_codes)
     for c, r in p1.items():
         result[c] = r
@@ -647,7 +940,7 @@ def main():
     print(f"  腾讯命中 {len(p1)}/{len(pool_codes)}", flush=True)
 
     # ---- pass 2: 腾讯美股 (必须带交易所后缀, 否则只有 2 行) ----
-    print(f"\n[2/5] 腾讯财经美股 ({len(us_codes)} 项, 自动发现交易所后缀) ...", flush=True)
+    print(f"\n[2/8] 腾讯财经美股 ({len(us_codes)} 项, 自动发现交易所后缀) ...", flush=True)
     us_map = discover_us_codes(list(tick_of.values()))
     print(f"  发现后缀 {len(us_map)}/{len(tick_of)}", flush=True)
 
@@ -671,7 +964,7 @@ def main():
     # ---- pass 3: 新浪美股 (备用源) ----
     need_us = [c for c in us_codes if c not in result]
     if need_us:
-        print(f"\n[3/5] 新浪财经美股 ({len(need_us)} 项) ...", flush=True)
+        print(f"\n[3/8] 新浪财经美股 ({len(need_us)} 项) ...", flush=True)
         for c in need_us:
             rows = src_sina_us(tick_of.get(c, ""), DAYS)
             if rows:
@@ -683,8 +976,9 @@ def main():
     # ---- pass 4: 东方财富 (兜底; 限流严格) ----
     need_em = [c for c in all_codes if c not in result]
     if need_em:
-        print(f"\n[4/5] 东方财富 ({len(need_em)} 项, 串行节流) ...", flush=True)
-        p4 = fetch_serial_pass(need_em, src_eastmoney, "东财", 2.2)
+        print(f"\n[4/8] 东方财富 ({len(need_em)} 项, 串行节流) ...", flush=True)
+        p4 = fetch_serial_pass(need_em, src_eastmoney, "东财", EM_INTERVAL,
+                                  max_consec_fail=EM_MAX_FAIL)
         for c, r in p4.items():
             result[c] = r
             source_of[c] = "东财"
@@ -693,7 +987,7 @@ def main():
     # ---- pass 5: 新浪 (兜底) ----
     need_sina = [c for c in all_codes if c not in result]
     if need_sina:
-        print(f"\n[5/5] 新浪财经 ({len(need_sina)} 项, 串行节流) ...", flush=True)
+        print(f"\n[5/8] 新浪财经 ({len(need_sina)} 项, 串行节流) ...", flush=True)
         p5 = fetch_serial_pass(need_sina, src_sina, "新浪", 0.45)
         for c, r in p5.items():
             result[c] = r
@@ -721,6 +1015,45 @@ def main():
     all_dates = all_dates[-DAYS:]
     dmap = {d: i for i, d in enumerate(all_dates)}
     print(f"交易日区间: {all_dates[0]} ~ {all_dates[-1]}  共 {len(all_dates)} 天", flush=True)
+
+    # ---- pass 6/7: 独立日期轴的另类品种 (期货 FU / 数字资产 CR) ----
+    #      这两类有自己的交易日历, 绝不并入 all_dates 主日历:
+    #      加密 7x24 按 UTC 00:00 收线, 期货按各自交易日历。
+    axes = {}
+    rolls = {}
+
+    print(f"\n[6/8] 期货主力连续 (新浪, 独立日期轴 FU, {len(FUT_LIST)} 个) ...", flush=True)
+    fu_raw = {}
+    for code, name, ind, market, sym, lim in FUT_LIST:
+        rows = src_sina_futures(sym, FU_DAYS)
+        if rows:
+            fu_raw[code] = rows
+        print(f"    {sym:<4} {len(rows) if rows else 0:>5} 根"
+              f"{'  ' + rows[-1][0] + ' c=' + rows[-1][2] if rows else '  FAIL'}", flush=True)
+        time.sleep(0.35)
+
+    print(f"\n[7/8] 数字资产 (Binance data-api -> Gate.io, 独立日期轴 CR, "
+          f"{len(CRY_LIST)} 个) ...", flush=True)
+    fxu = src_usdcny()
+    print(f"  USD/CNY 在岸价 = {fxu if fxu else '取不到(将按 1:1 记 USDT, 需人工核对)'}", flush=True)
+    cr_raw = {}
+    for code, name, ind, market, bsym, gpair, base, vol in CRY_LIST:
+        rows = src_binance_dataapi(bsym, CR_DAYS)
+        src = "Binance"
+        if not rows:
+            rows = src_gateio(gpair, CR_DAYS)
+            src = "Gate.io"
+        if rows and fxu:
+            # USDT 计价 -> 人民币计价 (成交量为基础币数量, 不折算)
+            rows = [[r[0]] + [("%.6f" % (float(r[k]) * fxu)) for k in (1, 2, 3, 4)] + [r[5]]
+                    for r in rows]
+        if rows:
+            cr_raw[code] = rows
+        print(f"    {bsym:<8} {len(rows) if rows else 0:>5} 根 "
+              f"({src if rows else 'FAIL'})"
+              f"{'  ' + rows[-1][0] + ' c=' + ('%.2f' % float(rows[-1][2])) if rows else ''}",
+              flush=True)
+        time.sleep(0.3)
 
     # ---- 退市/强赎剔除 (末个交易日过于陈旧) ----
     cutoff = all_dates[max(0, len(all_dates) - 1 - STALE_TOL)]
@@ -770,13 +1103,14 @@ def main():
     print(f"对齐完成: {len(series)} 个标的 × {len(all_dates)} 天", flush=True)
 
     # ---- meta ----
-    meta = [[p[0], p[1], p[2], p[3], p[4]] for p in POOL if p[0] in series]
+    # meta 第 6 位 = 独立日期轴名("" 表示跟随主日历 all_dates)
+    meta = [[p[0], p[1], p[2], p[3], p[4], ""] for p in POOL if p[0] in series]
 
     # ---- 美股: 抓到的用真实数据, 未抓到的才合成 ----
     from collections import Counter as _C
     synth = []
     for code, name, ind, base, vol, drift, _tick in US_LIST:
-        meta.append([code, name, ind, "us", 0])
+        meta.append([code, name, ind, "us", 0, ""])
         if code not in series:
             series[code] = gen_synth(code, base, vol, drift, all_dates, 100)
             synth.append(code)
@@ -787,12 +1121,112 @@ def main():
     # ---- 外汇 / 银行理财: 合成 ----
     for code, name, ind, base, vol, drift in FX_PAIRS:
         series[code] = gen_synth(code, base, vol, drift, all_dates, 10000)
-        meta.append([code, name, ind, "fx", 0])
+        meta.append([code, name, ind, "fx", 0, ""])
     for code, name, level, base, vol, drift in WM_PRODUCTS:
         series[code] = gen_synth(code, base, vol, drift, all_dates, 10000, floor=0.60)
-        meta.append([code, name, f"理财{level}", "wm", 0])
+        meta.append([code, name, f"理财{level}", "wm", 0, ""])
     synthetic = set(synth) | {p[0] for p in FX_PAIRS} | {w[0] for w in WM_PRODUCTS}
     print(f"合成: 外汇 {len(FX_PAIRS)} + 银行理财 {len(WM_PRODUCTS)}", flush=True)
+
+    # ==================================================================
+    #  另类品种落盘: 独立日期轴 -> 换月点 -> 区间聚合重采样 -> meta
+    # ==================================================================
+    def build_axis(raw_map, axis_name, label, scale):
+        """把某条独立日期轴的原始行 -> 主日历定长序列; 同时记录轴与换月点。"""
+        if not raw_map:
+            print(f"  {label}: 无可用数据, 跳过", flush=True)
+            return 0
+        lo, hi = all_dates[0], all_dates[-1]
+        ds = sorted({r[0] for rows in raw_map.values() for r in rows})
+        ds = [d for d in ds if lo <= d <= hi]           # 裁到主日历窗口
+        if not ds:
+            print(f"  {label}: 窗口内无数据, 跳过", flush=True)
+            return 0
+        axes[axis_name] = ds
+        n_roll = 0
+        for code, rows in sorted(raw_map.items()):
+            rp = [d for d in roll_points(rows) if lo <= d <= hi]
+            rolls[code] = rp
+            n_roll += len(rp)
+            m_ = {}
+            for r in rows:
+                m_[r[0]] = (float(r[1]), float(r[2]), float(r[3]),
+                            float(r[4]), float(r[5] or 0))
+            series[code] = resample_axis(ds, m_, all_dates, scale)
+        print(f"  {label} 轴 {len(ds)} 天 ({ds[0]} ~ {ds[-1]}), "
+              f"{len(raw_map)} 个标的, 换月跳空点 {n_roll} 个", flush=True)
+        for code in sorted(raw_map):
+            if rolls.get(code):
+                print(f"      {code} 换月: {', '.join(rolls[code][:8])}"
+                      f"{' ...' if len(rolls[code]) > 8 else ''}", flush=True)
+        return len(raw_map)
+
+    print("\n另类品种落盘 ...", flush=True)
+    n_fu = build_axis(fu_raw, "FU", "期货 FU", 100)
+    n_cr = build_axis(cr_raw, "CR", "数字资产 CR", 100)
+
+    # 期货 meta (未抓到的降级为合成, 标「模拟历史」)
+    fu_synth = []
+    for code, name, ind, market, sym, lim in FUT_LIST:
+        if code in series:
+            meta.append([code, name, ind, market, lim, "FU"])
+        else:
+            base, vol = FUT_SYNTH.get(code, (560.0, 0.012))
+            series[code] = gen_synth(code, base, vol, 0.0, all_dates, 100)
+            meta.append([code, name, ind, market, lim, ""])
+            synthetic.add(code)
+            fu_synth.append(code)
+    if fu_synth:
+        print(f"  期货合成降级: {', '.join(fu_synth)}", flush=True)
+
+    # 数字资产 meta (未抓到的降级为合成)
+    cr_synth = []
+    for code, name, ind, market, bsym, gpair, base, vol in CRY_LIST:
+        if code in series:
+            meta.append([code, name, ind, market, 0, "CR"])
+        else:
+            series[code] = gen_synth(code, base, vol, 0.0, all_dates, 100)
+            meta.append([code, name, ind, market, 0, ""])
+            synthetic.add(code)
+            cr_synth.append(code)
+    if cr_synth:
+        print(f"  数字资产合成降级: {', '.join(cr_synth)}", flush=True)
+
+    # 期权: 只落「标的 ETF」序列, 期权链运行时 BSM 生成(Q7 决定, 不落盘)
+    for code, name, ind, market, und in OPT_LIST:
+        if und in series:
+            series[code] = list(series[und])
+            meta.append([code, name, ind, market, 0, ""])
+    n_opt = len([1 for c, *_ in OPT_LIST if c in series])
+
+    # 私募/信托: 非净值型, 序列 = 应计单位净值(按 252 交易日/年线性累积)
+    n_pm = 0
+    for code, name, ind, market, annual in PM_PRODUCTS:
+        arr = [0] * (len(all_dates) * 5)
+        for i in range(len(all_dates)):
+            iv = int(round((1.0 + annual * (i + 1) / 252.0) * 10000))
+            b = i * 5
+            arr[b] = arr[b + 1] = arr[b + 2] = arr[b + 3] = iv
+            arr[b + 4] = 0
+        series[code] = arr
+        meta.append([code, name, ind, market, 0, ""])
+        synthetic.add(code)
+        n_pm += 1
+
+    # 另类/结构性: 序列 = 挂钩标的的真实序列(收益规则在前端 game.js)
+    n_alt = 0
+    for code, name, ind, market, und in ALT_PRODUCTS:
+        if und in series:
+            series[code] = list(series[und])
+            meta.append([code, name, ind, market, 0, ""])
+            n_alt += 1
+        else:
+            print(f"  [warn] ALT 挂钩标的 {und} 缺失, 跳过 {code}", flush=True)
+
+    print(f"  落盘: 期货 {n_fu} / 数字资产 {n_cr} / 期权标的 {n_opt} / "
+          f"私募信托 {n_pm} / 另类 {n_alt}", flush=True)
+    print(f"  独立日期轴: " + (", ".join(f"{k}={len(v)}天" for k, v in sorted(axes.items()))
+                          if axes else "无"), flush=True)
 
     # ---- 合规财经 RSS -> 滚动新闻条 ----
     print("\n抓取财经 RSS ...", flush=True)
@@ -828,7 +1262,10 @@ def main():
 
     # ---- 输出 ----
     payload = {"m": meta, "d": all_dates, "s": series, "dv": dv,
-               "syn": sorted(synthetic), "news": news}
+               "syn": sorted(synthetic), "news": news,
+               "ax": axes,          # 独立日期轴 {FU:[...], CR:[...]}
+               "rol": rolls,        # 主力连续换月跳空点 {code:[date,...]}
+               "fxu": fxu}          # 构建期 USD/CNY 在岸价(USDT->人民币折算率)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("/* 自动生成 - 真实历史行情快照, 请勿手工修改 */\n")
@@ -845,6 +1282,10 @@ def main():
     print(f"     分区: " + ", ".join(f"{k}={v}" for k, v in sorted(zone.items())))
     print(f"     交易日 {all_dates[0]} ~ {all_dates[-1]} ({len(all_dates)} 天)")
     print(f"     除权事件 {len(dv)} 条, 新闻 {len(news)} 条, 模拟序列 {len(synthetic)} 个")
+    print(f"     独立日期轴 " + (", ".join(f"{k}={len(v)}天" for k, v in sorted(axes.items()))
+                            if axes else "无")
+          + f"; 换月跳空点 {sum(len(v) for v in rolls.values())} 个"
+          + (f"; USD/CNY={fxu}" if fxu else ""))
 
 
 if __name__ == "__main__":

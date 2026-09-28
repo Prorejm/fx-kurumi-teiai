@@ -17,6 +17,9 @@ window.Market = (function () {
     idx: 0, mode: 'replay',
     quotes: {},        // code -> 实时快照
     intraday: {},      // code -> [{t,p,v}]
+    axes: {},          // 独立日期轴 {FU:[date], CR:[date]} (T03: 不并入主日历)
+    rolls: {},         // 主力连续换月跳空点 {code:[date]} (算波动率/收益率时剔除)
+    fxu: 0,            // 构建期 USD/CNY 在岸价
     startIdx: 0,
     online: false, lastTickAt: 0,
     scale: {},         // code -> 价格缩放 (100 股价 / 10000 汇率·净值)
@@ -43,21 +46,32 @@ window.Market = (function () {
   }
 
   /* ---------- 初始化 ---------- */
+  /* T03: 另类品种分区。fut=期货 opt=期权 cry=数字资产 pm=私募信托 alt=另类 */
+  const ZONE = {
+    main: 'A', gem: 'A', star: 'A', us: 'US', hk: 'HK', fx: 'FX',
+    fd: 'FD', rp: 'RP', wm: 'WM', cb: 'CB',
+    fut: 'FU', opt: 'OPT', cry: 'CR', pm: 'PM', alt: 'ALT'
+  };
+  /* 不进「自选/股票池」直接下单的品类:
+     index 指数 / rp 逆回购 / wm 银行理财 / alt 另类 / pm 私募信托 (走理财中心)
+     opt 期权 (走期权链弹窗, 不是普通下单)
+     fut 期货 / cry 数字资产 —— T03-CP1 数据先行落地, CP2 接线后从本集合移除 */
+  const NOT_TRADABLE = { index: 1, rp: 1, wm: 1, alt: 1, pm: 1, opt: 1, fut: 1, cry: 1 };
+
   function init(snap) {
-    const ZONE = {
-      main: 'A', gem: 'A', star: 'A', us: 'US', hk: 'HK', fx: 'FX',
-      fd: 'FD', rp: 'RP', wm: 'WM', cb: 'CB'
-    };
     S.meta = snap.m.map(a => ({
       code: a[0], name: a[1], ind: a[2],
       market: a[3], limitPct: a[4],
-      /* rp(逆回购) / wm(银行理财) 不是「股票池里的可交易标的」——
-         逆回购走理财中心的期限下单, 理财走净值申购, 都不进自选列表 */
-      tradable: a[3] !== 'index' && a[3] !== 'rp' && a[3] !== 'wm',
+      /* 第 6 位 = 独立日期轴名 ('' 表示跟随主日历 all_dates) */
+      ax: a[5] || '',
+      tradable: !NOT_TRADABLE[a[3]],
       zone: a[3] === 'index' ? 'IDX' : (ZONE[a[3]] || 'A')
     })).filter(s => !S.seen_(s.code));
     S.dates = snap.d;
     S.series = snap.s;
+    S.axes = snap.ax || {};         // 独立日期轴 {FU:[...], CR:[...]}
+    S.rolls = snap.rol || {};       // 主力连续换月跳空点 {code:[date,...]}
+    S.fxu = snap.fxu || 0;          // 构建期 USD/CNY (USDT -> 人民币折算率)
     S.divcal = snap.dv || [];       // 除权日历 [{c,d,s}]
     S.news = snap.news || [];       // 内置 RSS 快讯 (构建期抓取)
     S.idx = snap.d.length - 1;
@@ -84,7 +98,9 @@ window.Market = (function () {
     S.divByDate = {};
     for (const m of S.meta) {
       S.byCode[m.code] = m;
-      S.scale[m.code] = (m.market === 'fx' || m.market === 'wm') ? 10000 : 100;
+      /* fx 汇率 / wm 银行理财 / pm 私募信托 为净值口径 -> 10000 */
+      S.scale[m.code] = (m.market === 'fx' || m.market === 'wm' || m.market === 'pm')
+        ? 10000 : 100;
       if (m.market === 'cb') {
         S.cbSet[m.code] = 1;
         S.listIdx[m.code] = firstLiveBar(m.code);
@@ -454,6 +470,20 @@ window.Market = (function () {
     const v = S.listIdx[code];
     return v === undefined ? -1 : v;
   }
+  /* ---------- T03 另类品种 ---------- */
+  const mk = c => { const m = S.byCode[c]; return m ? m.market : ''; };
+  function isFut(c) { return mk(c) === 'fut'; }
+  function isCry(c) { return mk(c) === 'cry'; }
+  function isOpt(c) { return mk(c) === 'opt'; }
+  function isPM(c) { return mk(c) === 'pm'; }
+  function isAlt(c) { return mk(c) === 'alt'; }
+  /* 独立日期轴: '' 表示跟随主日历 */
+  function axisOf(c) { const m = S.byCode[c]; return m ? m.ax : ''; }
+  function axisDates(name) { return S.axes[name] || null; }
+  /* 主力连续换月跳空点(日期数组) —— 算收益率/波动率前须剔除 */
+  function rollDates(c) { return S.rolls[c] || []; }
+  function isRoll(c, d) { const r = S.rolls[c]; return !!r && r.indexOf(d) >= 0; }
+
   /* 当日除权事件 */
   function dividendsOn(d) {
     return S.divByDate[d === undefined ? date() : d] || [];
@@ -477,8 +507,12 @@ window.Market = (function () {
     fetchQuotes, fetchIntraday, fetchDaily, restored, benchLevel, fetchNews,
     metaOf, isCB, isRepo, isWealth, scaleOf, listIdx, avgVol,
     dividendsOn, dividendsOf,
+    isFut, isCry, isOpt, isPM, isAlt, axisOf, axisDates, rollDates, isRoll,
     get meta() { return S.meta; },
     get dates() { return S.dates; },
+    get axes() { return S.axes; },
+    get rolls() { return S.rolls; },
+    get fxu() { return S.fxu; },
     get idx() { return S.idx; },
     get divcal() { return S.divcal; },
     get news() { return S.news; },

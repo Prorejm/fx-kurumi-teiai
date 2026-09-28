@@ -88,8 +88,17 @@ const ck = (k, cond, extra) => {
     up: ChartKit.theme().up, down: ChartKit.theme().down
   }));
   log('ENGINE', eng);
-  ck('标的数 243', eng.metas === 243, eng.metas);
-  ck('可交易标的 213', eng.tradable === 213, eng.tradable);
+  /* 计数基线更新 (T03-CP1, 2026-09-29): 243 -> 261。新增 18 个标的 =
+     sh510050(期权标的, +1 可交易)
+     + 期货主力连续 7 (futAU/AG/SC/RB/CU/I/M)
+     + 数字资产 2 (cryBTC/cryETH)
+     + 期权标的 2 (opt510300/opt510050)
+     + 私募信托 2 (pmFUND/pmTRUST)
+     + 另类 4 (altSNOW/altLINK/altGOLD/altACC)
+     可交易: 213 -> 214 (仅 sh510050 为可交易 ETF; 其余新分区 CP1 阶段
+     数据先行落地, tradable 暂为 false, CP2/CP3 接线后放开)。 */
+  ck('标的数 261', eng.metas === 261, eng.metas);
+  ck('可交易标的 214', eng.tradable === 214, eng.tradable);
   ck('历史日期序列完整', eng.dates > 400, eng.dates);
   ck('影子价格 + 黑天鹅引擎在', eng.px && eng.swan, [eng.px, eng.swan]);
   // 因新增 opt.micro / opt.microLevel 两个配置项而同步更新 8 → 10：仅计数期望值随产品意图变更，断言逻辑未改
