@@ -4,27 +4,49 @@
  * window.Micro · IIFE 单例 · 零依赖 · 零构建 · 全部随机性走 hash01（禁止 Math.random）
  *
  * 阶段：
- *   T02a  = 'skeleton'   仅接线，factor() 恒为 1（零影响）
- *   T02b-CP1 本文件当前阶段：订单簿 + 5 类代理 + 撮合 + 逐笔 + 分时聚合。
- *            **factor() 仍返回字面量 1** ⇒ 对外价格零影响（kAt 逐位不变）。
- *            载入期与调用期均不修改 Game.G / Market 的任何状态（只做纯计算 + 缓存）。
+ *   T02a      = 'skeleton'      仅接线，factor() 恒为 1（零影响）
+ *   T02b-CP1  = 'cp1-orderbook' 订单簿 + 5 类代理 + 撮合 + 逐笔 + 分时聚合。
+ *                               factor() 仍返回字面量 1 ⇒ 对外价格零影响。
+ *   T02b-CP2  = 'cp2-takeover'（本文件当前阶段）
+ *              玩家流 → Kyle λ → 引力锚（OU）carry 递推 → 定价接管。
+ *              Micro.factor = exp(carry)；**无玩家交易 ⇒ carry≡0 ⇒ factor 精确 === 1**。
  *
  * 契约（架构 §决策2）：
- *   - 以宿主 Game.G（种子/opt）与 Market（历史序列）为唯一输入，不私有可变价格状态
+ *   - 以宿主 Game.G（种子/opt/microCarry）与 Market（历史序列）为唯一输入
  *   - 分时序列 = 逐笔成交按分钟聚合（内生涌现，非对历史 bar 的线性/正弦插值）
- *   - NPC 净流驱动日内路径；日终校准与玩家冲击将在 CP2 接入（届时 factor → exp(carry)）
+ *   - carry 的唯一来源是「玩家当日净订单流」；NPC 净流按锚定校准，对 carry 贡献 0
+ *   - micro 关闭 ⇒ factor 立即返回 1 ⇒ kAt 逐位回退（P0-C8）
  * ========================================================================== */
 window.Micro = (function () {
   'use strict';
 
-  var STAGE = 'cp1-orderbook';
+  var STAGE = 'cp2-takeover';
   var LEVELS = ['lite', 'std', 'hard'];
   var MINUTES = 240;                 // 交易日分钟数（9:30-11:30 + 13:00-15:00）
   var AGENTS = ['retail', 'hotmoney', 'inst', 'quant', 'mm'];   // mm 最后：库存对冲需读累计净流
   var LAMBDA = 0.0025;               // 内部（可视化）冲击系数，仅决定分时形态尺度
 
+  /* ---- CP2：引力锚（OU）参数表（架构 §决策2 半衰期表）---- */
+  var PARAMS = {
+    lite: { H: 8,  lam: 0.006 },     // 简化：回归强、接近历史
+    std:  { H: 20, lam: 0.010 },     // 标准（默认）
+    hard: { H: 40, lam: 0.015 }      // 硬核：回归弱、更独立
+  };
+  var CAP = 0.5;                     // 对数偏离上限 ±50%（clamp）
+  var ADV_REF = 1e8;                 // 流动性修正基准 ADV（元）
+  /* 永久冲击「吸收门限」：占 ADV 不足 PERM_MIN 的委托当日即被盘口吸收，不产生**永久**冲击
+     （其临时冲击已由 game.js 的 impactSlip / fillPrice 建模）。超过该门限的部分才走平方
+     根律：imp = λ·sqrt(max(0, |X|/ADV − PERM_MIN))。取 0.1% —— 对设计验收档位
+     （X/ADV = 10%/50%/100%/300%）的影响 < 0.5%，远小于其 dev 阈值余量。 */
+  var PERM_MIN = 1e-3;
+  var HIST_MAX = 240;                // 每标的最多保留的 carry 历史点（供 K 线回看）
+
   var cache = {};                    // code@i → dayData（纯派生，可随时丢弃）
-  var state = { seed: null, hot: [] };
+  var state = {
+    seed: null,
+    hot: [],
+    pending: {}                      // code → 当日尚未结算的玩家净订单流（元，正=买）
+  };
 
   /* ------------------------------------------------------------ 确定性随机 */
 
@@ -55,12 +77,21 @@ window.Micro = (function () {
     try { if (window.Game && Game.G && Game.G.bSeed) return Game.G.bSeed; } catch (e) { /* ignore */ }
     return state.seed || '0';
   }
+  function currentIdx() {
+    try { if (window.Market && Market.idx !== undefined) return Market.idx; } catch (e) { /* ignore */ }
+    return 0;
+  }
+  function metaOf(code) {
+    try { if (window.Market && Market.metaOf) return Market.metaOf(code); } catch (e) { /* ignore */ }
+    return null;
+  }
 
   function enabled() { return optGet('micro', true) !== false; }
   function level() {
     var lv = optGet('microLevel', 'std');
     return LEVELS.indexOf(lv) !== -1 ? lv : 'std';
   }
+  function levelParams() { return PARAMS[level()] || PARAMS.std; }
 
   /* ------------------------------------------------------------ 派生参数 */
 
@@ -73,6 +104,24 @@ window.Micro = (function () {
       v = (b && b.v) || 1e5;
     }
     return v;
+  }
+
+  /**
+   * 玩家冲击的流动性基准：当日 ADV（**元**）。
+   * MetaData.market='cb' ⇒ 每手 10 张，其余每手 100 股。
+   */
+  function advNotional(code, i) {
+    var v = 0;
+    try { if (window.Market && Market.avgVol) v = Market.avgVol(code, 20); } catch (e) { /* ignore */ }
+    var m = metaOf(code);
+    var mult = (m && m.market === 'cb') ? 10 : 100;      // 快照量(手) → 股/张
+    var shares = (v > 0 && isFinite(v)) ? v * mult : 0;
+    var b = rawAt(code, i);
+    var px = (b && b.c > 0) ? b.c : 0;
+    if (!(px > 0)) { try { if (window.Market && Market.price) px = Market.price(code); } catch (e) { /* ignore */ } }
+    if (!(px > 0)) px = 10;
+    if (!(shares > 0)) shares = ((b && b.v) ? b.v : 1e5) * mult;
+    return shares * px;
   }
 
   /** 近 20 日日收益标准差（日波动率）；不足 5 日回落 1.5%。 */
@@ -208,9 +257,7 @@ window.Micro = (function () {
   }
 
   function dayData(code, i) {
-    if (i === undefined) {
-      try { i = window.Market ? Market.idx : 0; } catch (e) { i = 0; }
-    }
+    if (i === undefined) i = currentIdx();
     var key = code + '@' + i;
     var hit = cache[key];
     if (hit) return hit;
@@ -219,17 +266,101 @@ window.Micro = (function () {
     return d;
   }
 
-  /* ------------------------------------------------------------ 定价接口（CP1：仍为零影响） */
+  /* ------------------------------------------------------------ 引力锚（OU）定价 */
+  /*   ln P = ln A + carry ；A = raw.c × bfactorAt × swanFactor（由 game.js 组合）
+   *   carry_i = clamp( carry_{i-1}·exp(−θ_eff) + imp_i , ±CAP )
+   *   imp_i   = Kyle：λ_sqrt(level)·sign(flow_i)·sqrt(|flow_i|/ADV)
+   *   θ_eff   = (ln2/H)·g_liq(ADV)·h(|carry|)
+   *   ---- carry 的唯一来源是玩家净订单流；NPC 净流按锚定校准，贡献 0 ----
+   */
 
-  /** 订单流乘子。CP1 仍返回字面量 1 ⇒ kAt 逐位不变；CP2 起返回 exp(carry)。 */
-  function factor(code, i) { return 1; }
+  /** carry 持久层：G.microCarry = { code: [[i,carry], …] }（进存档，可复现玩家拉抬） */
+  function carryMap() {
+    try {
+      if (window.Game && Game.G) {
+        if (!Game.G.microCarry || typeof Game.G.microCarry !== 'object') Game.G.microCarry = {};
+        return Game.G.microCarry;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
 
-  /** 引力锚累积偏离。CP1 恒为 0。 */
-  function carry(code) { return 0; }
+  /** 第 i 日适用的 carry（取最近一个 ≤ i 的历史点；无则 0）。 */
+  function carryAt(code, i) {
+    var m = carryMap();
+    if (!m) return 0;
+    var h = m[code];
+    if (!h || !h.length) return 0;
+    var cv = 0;
+    for (var k = 0; k < h.length; k++) {
+      if (h[k][0] <= i) cv = h[k][1];
+      else break;
+    }
+    return cv;
+  }
 
-  /* ------------------------------------------------------------ 公共读取（CP1 新增） */
+  /** 当前（最新）carry；无玩家交易 ⇒ 0。 */
+  function carry(code) {
+    var m = carryMap();
+    var h = m && m[code];
+    return (h && h.length) ? h[h.length - 1][1] : 0;
+  }
 
-  /** 分时序列（= 逐笔按分钟聚合）。 */
+  /** 流动性修正 g_liq：ADV 越大回归越强（上限 1.6 / 下限 0.6）。 */
+  function gLiq(advN) {
+    return clamp(0.6 + 0.4 * Math.log10(Math.max(1, advN) / ADV_REF), 0.6, 1.6);
+  }
+
+  /** 偏离放大回归强度 h(|carry|)：偏离越大回归越强（上限 6）。 */
+  function hOf(carryVal, sigma) {
+    var s = (sigma > 0) ? sigma : 0.015;
+    return clamp(1 + Math.abs(carryVal) / s, 1, 6);
+  }
+
+  /** 有效回归速率 θ_eff = (ln2/H)·g_liq·h(|carry|)。 */
+  function thetaEff(code, i, sigma, carryVal) {
+    var P = levelParams();
+    return (Math.LN2 / P.H) * gLiq(advNotional(code, i)) * hOf(carryVal, sigma);
+  }
+
+  /**
+   * Kyle λ 冲击项（对数）：imp = λ·sign(X)·sqrt(|X|/ADV)。
+   * 采用「吸收门限」形式：先扣掉被盘口当日吸收的 PERM_MIN·ADV，剩余部分才产生永久冲击。
+   * 于是小额委托（如 1 手）严格 imp === 0 ⇒ carry≡0 ⇒ factor 精确 === 1（IEEE 精确回退）。
+   */
+  function kyleImp(code, i, flowNotional) {
+    if (!flowNotional || !isFinite(flowNotional)) return 0;
+    var adv = advNotional(code, i);
+    if (!(adv > 0)) return 0;
+    var P = levelParams();
+    var part = Math.abs(flowNotional) / adv - PERM_MIN;
+    if (part <= 0) return 0;                    // 被吸收 ⇒ 无永久冲击（严格零）
+    return P.lam * sign(flowNotional) * Math.sqrt(part);
+  }
+
+  /**
+   * 订单流乘子。
+   * - micro 关闭 ⇒ 立即返回 1（逐位回退）
+   * - 无玩家冲击（carry 与当日 pending 皆 0）⇒ 精确返回字面量 1（exp(0)===1）
+   * - 否则 ⇒ exp(carry)
+   */
+  function factor(code, i) {
+    if (!enabled()) return 1;
+    var idx = currentIdx();
+    var ii = (i === undefined) ? idx : i;
+    var c = carryAt(code, ii);
+    // 当前日叠加「尚未结算」的玩家净流冲击，使玩家当日即看到价格反应
+    if (ii === idx) {
+      var pend = state.pending[code];
+      if (pend) c += kyleImp(code, ii, pend);
+    }
+    if (c === 0) return 1;
+    return Math.exp(c);
+  }
+
+  /* ------------------------------------------------------------ 公共读取 */
+
+  /** 分时序列（= 逐笔按分钟聚合，内生涌现）。 */
   function minute(code, i) { return dayData(code, i).minutes; }
 
   /** 逐笔成交（tick prints）。 */
@@ -255,10 +386,54 @@ window.Micro = (function () {
   /** 5 类代理当日净流入（股 + 金额）。 */
   function agents(code, i) { return dayData(code, i).agents; }
 
-  /** 引力锚（CP1 占位：返回当日参考锚价 prevClose）。 */
+  /** 引力锚（原始收盘锚 raw.c）；带 microFactor 的最终价由 game.js 组合。 */
   function anchor(code, i) {
     var d = dayData(code, i);
     return d.prevClose || 0;
+  }
+
+  /* ------------------------------------------------------------ 玩家流 & 逐日递推 */
+
+  /**
+   * 登记玩家当日净订单流（元，正=买/负=卖）。
+   * micro 关闭时整段短路（A4：关闭 ⇒ dev==0）。
+   * @returns {number} 当日截至目前的累计净流
+   */
+  function applyPlayerFlow(G, code, X) {
+    if (!enabled()) return 0;
+    if (!code || !X || !isFinite(X) || X === 0) return 0;
+    state.pending[code] = (state.pending[code] || 0) + X;
+    return state.pending[code];
+  }
+
+  /**
+   * 逐日推进（在 game.js stepDay 中于 Market.next(1) 之后调用）：
+   * 对每个有过 carry / 当日有玩家流的标的，做一次 OU 递推并落盘到 G.microCarry。
+   */
+  function step(G, i) {
+    if (!enabled()) { state.pending = {}; return; }
+    var m = carryMap();
+    if (!m) return;
+    var idx = (i === undefined) ? currentIdx() : i;
+
+    var codes = {};
+    for (var c1 in state.pending) codes[c1] = 1;
+    for (var c2 in m) codes[c2] = 1;
+
+    for (var code in codes) {
+      var prev = carry(code);
+      var flow = state.pending[code] || 0;
+      if (prev === 0 && flow === 0) continue;
+      var sigma = dailyVol(code, idx);
+      var th = thetaEff(code, idx, sigma, prev);
+      var imp = kyleImp(code, idx, flow);
+      var next = clamp(prev * Math.exp(-th) + imp, -CAP, CAP);
+      if (!isFinite(next)) next = prev;
+      var h = m[code] || (m[code] = []);
+      h.push([idx, next]);
+      if (h.length > HIST_MAX) h.splice(0, h.length - HIST_MAX);
+    }
+    state.pending = {};
   }
 
   /* ------------------------------------------------------------ 生命周期 */
@@ -266,18 +441,26 @@ window.Micro = (function () {
   function reset(seed) {
     state.seed = (seed === undefined) ? null : seed;
     state.hot = [];
+    state.pending = {};
     cache = {};
     return true;
   }
   function getState() {
+    var m = carryMap();
+    var n = 0;
+    for (var k in (m || {})) n++;
     return {
       stage: STAGE, enabled: enabled(), level: level(), seed: state.seed,
       hot: state.hot.slice(), cacheSize: Object.keys(cache).length,
-      minutesPerDay: MINUTES, agents: AGENTS.slice()
+      minutesPerDay: MINUTES, agents: AGENTS.slice(),
+      carryCodes: n, pendingCodes: Object.keys(state.pending).length
     };
   }
   function setOpt(key, val) {
-    if (key === 'micro' || key === 'microLevel') cache = {};   // 档位/开关变化 → 丢弃派生缓存
+    if (key === 'micro' || key === 'microLevel') {
+      cache = {};                                  // 档位/开关变化 → 丢弃派生缓存
+      if (key === 'micro' && val === false) state.pending = {};   // 关闭即清当日待结算流
+    }
     return true;
   }
   function setHot(codes) {
@@ -285,28 +468,28 @@ window.Micro = (function () {
     return state.hot.length;
   }
 
-  /** 逐日推进（CP1：惰性计算，不预计算；正式热集推进在 CP3）。 */
   function init(G, deps) { return true; }
-  function step(G, i) { /* CP1: 惰性；不做急切计算，零额外开销 */ }
-
-  /* CP2 预留 */
-  function applyPlayerFlow(G, code, X) { return 0; }
 
   return {
     STAGE: STAGE,
     LEVELS: LEVELS,
     MINUTES_PER_DAY: MINUTES,
     AGENT_NAMES: AGENTS.slice(),
+    PARAMS: PARAMS,
+    CAP: CAP,
+    PERM_MIN: PERM_MIN,
     /* 配置 */
     enabled: enabled, level: level,
     /* 定价 */
-    factor: factor, carry: carry,
+    factor: factor, carry: carry, carryAt: carryAt,
+    /* 玩家流 */
+    applyPlayerFlow: applyPlayerFlow,
     /* 生命周期 */
     reset: reset, getState: getState, setOpt: setOpt, setHot: setHot,
     init: init, step: step,
     /* 微观读取 */
     minute: minute, ticks: ticks, book: book, agents: agents, anchor: anchor,
-    /* CP2 预留 */
-    applyPlayerFlow: applyPlayerFlow
+    /* 派生量（供测试/UI 复用同一口径） */
+    advNotional: advNotional, kyleImp: kyleImp, thetaEff: thetaEff
   };
 })();

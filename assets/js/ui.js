@@ -576,6 +576,16 @@ window.UI = (function () {
           return;
         }
       }
+      /* 微观结构（默认开）：分时由「逐笔成交按分钟聚合」内生涌现，按 §6.5 如实标注为合成推演。
+         micro 关闭时整段跳过，回落既有「开高低收还原」路径（行为逐位不变）。 */
+      if (window.Micro && typeof Micro.minute === 'function' && Micro.enabled()) {
+        const mm = Micro.minute(S.code, Market.idx);
+        if (mm && mm.length) {
+          ChartKit.minute(el.kchart, mm.map(x => ({ p: x.c * k, v: x.v })), Market.prevClose(S.code) * k,
+            '当日走势 · 逐笔撮合推演');
+          return;
+        }
+      }
       const r = Market.restored(S.code, Market.idx);
       if (r) {
         ChartKit.minute(el.kchart, r.pts.map(x => ({ p: x.p * k, v: x.v })), r.prevClose * k,

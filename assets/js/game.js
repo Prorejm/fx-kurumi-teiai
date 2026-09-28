@@ -292,6 +292,7 @@ window.Game = (function () {
     butterfly: 0,               // 反后视镜强度 0~1
     hindsight: 0, auditN: 0,    // 后视镜命中 / 已审计次数
     bSeed: '', bStart: {},      // 蝴蝶扰动种子 / 各标的扰动起点
+    microCarry: {},             // 微观结构：玩家冲击累积量 { code: [[idx,carry], …] }（进存档）
     /* ---- 黑天鹅事件 ---- */
     swans: [], swanLog: [], swanSeq: 0,
     /* ---- 玩法开关 (默认全开, 可在「设置」中调节) ---- */
@@ -489,6 +490,8 @@ window.Game = (function () {
         : '可用资金不足 (需 ' + money(need) + ')');
     }
     noteImpact(code, shares, fee, fp.slip);
+    /* 微观结构：玩家买入净流 → Kyle λ → carry（正号推高） */
+    if (window.Micro && typeof Micro.applyPlayerFlow === 'function') Micro.applyPlayerFlow(G, code, amount);
 
     const existing = pos(code);
     if (existing) {
@@ -557,6 +560,8 @@ window.Game = (function () {
         : '可用资金不足 (需 ' + money(need) + ')');
     }
     noteImpact(code, shares, fee, fp.slip);
+    /* 微观结构：融券卖出净流 → Kyle λ → carry（负号压低） */
+    if (window.Micro && typeof Micro.applyPlayerFlow === 'function') Micro.applyPlayerFlow(G, code, -amount);
 
     const existing = pos(code);
     if (existing) {
@@ -626,6 +631,8 @@ window.Game = (function () {
     G.realized += pnl - dtax;
     consumeLots(p, shares);
     noteImpact(code, shares, fee, fp.slip);
+    /* 微观结构：卖出净流 → Kyle λ → carry（负号压低） */
+    if (window.Micro && typeof Micro.applyPlayerFlow === 'function') Micro.applyPlayerFlow(G, code, -amount);
     if (dtax > 0) {
       G.divTax += dtax;
       log('红利税', code, meta ? meta.name : code, '按持股期限补缴红利税 ' + money(dtax), 'warn');
@@ -673,6 +680,8 @@ window.Game = (function () {
     G.realized += pnl;
     consumeLots(p, shares);
     noteImpact(code, shares, fee, fp.slip);
+    /* 微观结构：买券还券净流 → Kyle λ → carry（正号推高） */
+    if (window.Micro && typeof Micro.applyPlayerFlow === 'function') Micro.applyPlayerFlow(G, code, amount);
     p.shares -= shares;
     if (p.shares <= 0) {
       G.positions = G.positions.filter(x => x.code !== code);
@@ -731,6 +740,8 @@ window.Game = (function () {
       const realN = Market.next(1);
       if (realN <= 0) break;
       moved += realN;
+      /* 微观结构：玩家当日净流 → Kyle λ → 引力锚(OU) carry 递推（micro 关闭时整段短路） */
+      if (window.Micro && typeof Micro.step === 'function') Micro.step(G, Market.idx);
       accrueInterest(1);
       settleDividends();       // 除权除息派现 (派发时不预扣税)
       cbResolve();             // 可转债打新中签 / 缴款 / 弃购
@@ -1940,6 +1951,24 @@ window.Game = (function () {
   }
 
   /* ---------------- 存档 ---------------- */
+  /* 微观 carry 清洗：只保留 { code: [[idx, carry], …] } 结构，剔除非法值，杜绝 NaN */
+  function sanitizeCarry(raw) {
+    const out = {};
+    if (!raw || typeof raw !== 'object') return out;
+    Object.keys(raw).forEach(code => {
+      const src = raw[code];
+      if (!Array.isArray(src)) return;
+      const arr = [];
+      src.forEach(pt => {
+        if (!Array.isArray(pt) || pt.length < 2) return;
+        const idx = pt[0], c = pt[1];
+        if (Number.isFinite(idx) && Number.isFinite(c)) arr.push([idx, c]);
+      });
+      if (arr.length) out[code] = arr;
+    });
+    return out;
+  }
+
   function save() {
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify({
@@ -1962,6 +1991,7 @@ window.Game = (function () {
         impact: G.impact, impactLog: G.impactLog.slice(0, 20), shortFee: G.shortFee,
         butterfly: G.butterfly, hindsight: G.hindsight,
         bSeed: G.bSeed, bStart: G.bStart,
+        microCarry: G.microCarry,
         /* ---- 黑天鹅 / 玩法开关 ---- */
         swans: G.swans, swanLog: G.swanLog.slice(0, 24), swanSeq: G.swanSeq,
         opt: G.opt,
@@ -2021,6 +2051,8 @@ window.Game = (function () {
     G.hindsight = sv.hindsight || 0;
     G.bSeed = sv.bSeed || ('b' + Math.floor(Math.random() * 1e9));
     G.bStart = sv.bStart || {};
+    /* 微观结构 carry：玩家冲击累积量（旧存档缺失时兜底空对象，杜绝 undefined/NaN） */
+    G.microCarry = sanitizeCarry(sv.microCarry);
     /* ---- 黑天鹅 / 玩法开关 (旧存档逐项兜底, 默认全开) ---- */
     G.swans = sv.swans || [];
     G.swanLog = sv.swanLog || [];
@@ -2062,6 +2094,7 @@ window.Game = (function () {
     G.butterfly = 0; G.hindsight = 0; G.auditN = 0;
     G.bSeed = 'b' + Math.floor(Math.random() * 1e9);
     G.bStart = {};
+    G.microCarry = {};                       // 新局：清空玩家微观冲击累积
     if (window.Micro && typeof Micro.reset === 'function') Micro.reset(G.bSeed);
     /* 玩法开关默认全开 (opt.opt 可覆盖, 例如开局前在设置里关掉某些机制) */
     G.swans = []; G.swanLog = []; G.swanSeq = 0;
