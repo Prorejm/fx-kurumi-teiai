@@ -283,6 +283,39 @@ button{cursor:pointer}
   font-size:10.5px;line-height:1.8;color:var(--ink-soft);
 }
 
+/* ---------------- 姊妹版本互跳 ---------------- */
+.sis-row{margin-top:14px}
+.sis-btn{
+  display:flex;align-items:center;gap:11px;width:100%;text-align:left;
+  padding:11px 14px;border:1px solid var(--line-2);border-radius:var(--r2);
+  background:var(--card-2);color:var(--ink);text-decoration:none;cursor:pointer;
+  transition:border-color .16s,background .16s,box-shadow .16s;
+}
+.sis-btn:hover{border-color:var(--gold-line);background:var(--gold-soft);box-shadow:0 2px 9px rgba(23,56,95,.08)}
+.sis-btn:active{background:var(--gold-soft)}
+.sis-ic{
+  width:27px;height:27px;flex:0 0 auto;
+  background-size:contain;background-repeat:no-repeat;background-position:center;
+  filter:drop-shadow(0 1px 2px rgba(15,39,64,.16));
+}
+.sis-ic-kurumi{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 40 40'><rect width='40' height='40' rx='6' fill='%23ffd23f'/><rect x='1.6' y='1.6' width='36.8' height='36.8' rx='5' fill='none' stroke='%23191318' stroke-width='1.8'/><path d='M8 29 L16 19 L22 24 L32 11' stroke='%23e6392e' stroke-width='3.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+.sis-tx{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1 1 auto}
+.sis-tx b{font-size:12.5px;font-weight:800;color:var(--navy);letter-spacing:.01em}
+.sis-tx em{font-size:10.5px;font-style:normal;color:var(--ink-3);line-height:1.5}
+.sis-ar{font-size:13px;font-weight:700;color:var(--gold);flex:0 0 auto}
+
+.sis-chip{
+  display:inline-flex;align-items:center;gap:6px;align-self:flex-start;
+  padding:3px 10px;border:1px solid var(--navy-line);border-radius:99px;
+  background:var(--navy-soft);color:var(--navy);
+  font-size:10.5px;font-weight:700;letter-spacing:.02em;
+  text-decoration:none;white-space:nowrap;cursor:pointer;
+  transition:background .16s,border-color .16s;
+}
+.sis-chip:hover{background:#e2ebf7;border-color:var(--navy-2)}
+
 .bubble{
   position:relative;background:var(--card);border:1px solid var(--line-2);
   border-radius:var(--r);padding:9px 13px;font-size:12.5px;color:var(--ink-2);

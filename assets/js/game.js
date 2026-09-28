@@ -18,8 +18,10 @@ window.Game = (function () {
   const MORT_RATE = 0.04;        // 固定资产抵押年化 4%
   const CREDIT_START = 750;      // 初始信用分
   const CREDIT_BAD = 600;        // 失信阈值
-  const SAVE_KEY = 'kurumi_save_v1';
-  const LB_KEY = 'kurumi_lb_v1';
+  /* 帝爱版与韭留美版可能同域部署（GitHub Pages 子路径 /fx-kurumi/teiai/），
+     存储键必须分开，否则两个模拟器会互相覆盖存档与排行榜。 */
+  const SAVE_KEY = 'teiai_save_v1';
+  const LB_KEY = 'teiai_lb_v1';
 
   /* ---------------- 国债逆回购 (报价单位 = 年化利率%) ---------------- */
   const REPO_MIN = 1000;         // 沪深统一 1000 元起, 1000 元整数倍
